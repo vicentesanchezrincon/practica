@@ -13,6 +13,9 @@
     "@aws-cdk/aws-s3:createDefaultLoggingPolicy": true,
     "@aws-cdk/aws-ec2:restrictDefaultSecurityGroup": true,
     "@aws-cdk/core:enablePartitionLiterals": true,
-    "@aws-cdk/core:target-partitions": ["aws"]
+    "@aws-cdk/core:target-partitions": ["aws"],
+
+    "_comentario_referencias": "strong = un stack no se puede borrar mientras otro use sus outputs. Es lo que queremos: evita romper Glue por destruir Database.",
+    "@aws-cdk/core:defaultCrossStackReferences": "strong"
   }
 }

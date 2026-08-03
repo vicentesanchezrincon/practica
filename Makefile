@@ -125,3 +125,47 @@ deploy-dev: infra/.venv ## Despliega todos los stacks en dev
 .PHONY: destroy-dev
 destroy-dev: infra/.venv ## Destruye los stacks de dev (hazlo al acabar cada sesion)
 	$(CDK) destroy --all -c environment=dev --force
+
+# --------------------------------------------------------- siembra del RDS ---
+# El RDS esta en subredes aisladas: no lo alcanzas con psql. El camino es
+# Postgres local -> Parquet -> S3 -> job de Glue -> RDS.
+
+# Los stacks se llaman Practica-Dev-* / Practica-Prod-*
+ifeq ($(ENV),prod)
+STACK_PREFIX := Practica-Prod
+else
+STACK_PREFIX := Practica-Dev
+endif
+
+# El nombre del bucket se lee del output del stack, para no tenerlo a mano.
+BUCKET = $(shell aws cloudformation describe-stacks --stack-name $(STACK_PREFIX)-Storage \
+	--query "Stacks[0].Outputs[?OutputKey=='BucketName'].OutputValue" --output text 2>/dev/null)
+
+.PHONY: export-seed
+export-seed: ## Exporta el Postgres local a Parquet y lo sube a S3
+	@test -n "$(BUCKET)" || (echo "No encuentro el bucket. ¿Has hecho 'make deploy-dev'?" && exit 1)
+	$(IN_GLUE) 'python3 data_generator/export_seed.py'
+	aws s3 sync data/_seed "s3://$(BUCKET)/_seed" --delete
+	@echo "Subido a s3://$(BUCKET)/_seed"
+
+.PHONY: seed-rds
+seed-rds: ## Lanza el job de Glue que siembra el RDS y espera a que acabe
+	@JOB=practica-$(ENV)-seed-rds; \
+	RUN=$$(aws glue start-job-run --job-name $$JOB --query JobRunId --output text); \
+	echo "Job $$JOB lanzado (run $$RUN). Esperando..."; \
+	while true; do \
+	  ESTADO=$$(aws glue get-job-run --job-name $$JOB --run-id $$RUN --query JobRun.JobRunState --output text); \
+	  case $$ESTADO in \
+	    SUCCEEDED) echo "OK: $$ESTADO"; break;; \
+	    FAILED|ERROR|TIMEOUT|STOPPED) \
+	      echo "FALLO: $$ESTADO"; \
+	      aws glue get-job-run --job-name $$JOB --run-id $$RUN --query JobRun.ErrorMessage --output text; \
+	      exit 1;; \
+	    *) printf "  %s\r" $$ESTADO; sleep 15;; \
+	  esac; \
+	done
+
+.PHONY: db-creds
+db-creds: ## Muestra las credenciales del RDS (estan en Secrets Manager)
+	aws secretsmanager get-secret-value --secret-id practica/$(ENV)/postgres \
+		--query SecretString --output text | python3 -m json.tool
