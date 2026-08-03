@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Spark
+spark-warehouse/
+metastore_db/
+derby.log
+*.crc
+
+# Datos generados en local (nunca al repo)
+data/
+output/
+*.parquet
+
+# AWS CDK
+infra/cdk.out/
+infra/.venv/
+*.swp
+
+# Secretos y entorno
+.env
+.env.*
+!.env.example
+*.pem
+credentials
+
+# Editores
+.idea/
+.vscode/
+.DS_Store
+
+# Ajustes locales de Claude Code (no se comparten)
+.claude/settings.local.json
