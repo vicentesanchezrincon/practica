@@ -1,0 +1,7 @@
+.venv/
+cdk.out/
+
+# Cachea lookups de AWS e incluye el ID de cuenta. La convencion del CDK es
+# commitearlo, pero este repositorio es publico y el unico lookup que hacemos
+# (zonas de disponibilidad) se resuelve en segundos. No compensa publicarlo.
+cdk.context.json

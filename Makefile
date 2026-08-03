@@ -2,7 +2,12 @@
 SHELL := /bin/bash
 
 # El contenedor necesita tu GID para poder escribir en el proyecto montado.
-export HOST_GID := $(shell id -g)
+#
+# "id -g" a secas NO sirve: devuelve el grupo primario, y dentro de una shell
+# abierta con `newgrp docker` ese grupo pasa a ser "docker". El contenedor
+# arrancaria con el gid de docker y no podria escribir en tus ficheros.
+# "id -g $(id -un)" devuelve siempre el grupo real de /etc/passwd.
+export HOST_GID := $(shell id -g $$(id -un))
 
 COMPOSE := docker compose --env-file .env -f local/docker-compose.yml
 # Todo lo que sea PySpark se ejecuta DENTRO del contenedor de Glue,
@@ -75,27 +80,48 @@ test: ## Tests unitarios (PySpark local, sin AWS)
 test-integration: ## Tests de integracion (necesitan Postgres levantado)
 	$(IN_GLUE) 'python3 -m pytest tests/integration -m integration'
 
+# ruff vive en el contenedor (ver local/Dockerfile), no en el host: asi todo el
+# mundo usa la misma version sin instalar nada.
 .PHONY: lint
 lint: ## Comprueba estilo y formato
-	ruff check .
-	ruff format --check .
+	$(IN_GLUE) 'ruff check . && ruff format --check .'
 
 .PHONY: format
 format: ## Arregla estilo y formato
-	ruff check --fix .
-	ruff format .
+	$(IN_GLUE) 'ruff check --fix . && ruff format .'
 
 # -------------------------------------------------------------- despliegue ---
-# (se rellena en la Fase 2, cuando exista infra/)
+# El CDK corre en el HOST (no en el contenedor): necesita el CLI de node y tus
+# credenciales AWS. Los jobs de Spark corren en el contenedor. Son dos mundos.
+
+ENV ?= dev
+CDK := cd infra && . .venv/bin/activate && cdk
+
+infra/.venv: infra/requirements.txt
+	python3 -m venv infra/.venv
+	infra/.venv/bin/pip install --quiet --upgrade pip
+	infra/.venv/bin/pip install --quiet -r infra/requirements.txt
+	@touch infra/.venv
+
+.PHONY: infra-deps
+infra-deps: infra/.venv ## Crea/actualiza el venv del CDK
+
+.PHONY: test-infra
+test-infra: infra/.venv ## Tests de la infraestructura (sobre la plantilla, sin tocar AWS)
+	infra/.venv/bin/python -m pytest infra/tests -q
 
 .PHONY: synth
-synth: ## cdk synth del entorno dev
-	cd infra && cdk synth -c environment=dev
+synth: infra/.venv ## Genera el CloudFormation sin desplegar (ENV=dev|prod)
+	$(CDK) synth -c environment=$(ENV)
+
+.PHONY: diff
+diff: infra/.venv ## Muestra que cambiaria en AWS
+	$(CDK) diff --all -c environment=$(ENV)
 
 .PHONY: deploy-dev
-deploy-dev: ## Despliega todos los stacks en dev
-	cd infra && cdk deploy --all -c environment=dev --require-approval never
+deploy-dev: infra/.venv ## Despliega todos los stacks en dev
+	$(CDK) deploy --all -c environment=dev --require-approval never
 
 .PHONY: destroy-dev
-destroy-dev: ## Destruye los stacks de dev (hazlo al acabar cada sesion)
-	cd infra && cdk destroy --all -c environment=dev --force
+destroy-dev: infra/.venv ## Destruye los stacks de dev (hazlo al acabar cada sesion)
+	$(CDK) destroy --all -c environment=dev --force
