@@ -86,6 +86,36 @@ python3 data_generator/seed.py --mode daily --dirt-factor 10
 
 ---
 
+## Infraestructura (CDK)
+
+El CDK corre en el **host**, no en el contenedor: necesita Node y tus credenciales
+AWS. Los jobs de Spark corren en el contenedor. Son dos mundos separados.
+
+```bash
+sudo apt install -y python3.12-venv   # una sola vez: Ubuntu separa ensurepip
+make infra-deps                       # crea infra/.venv e instala aws-cdk-lib
+make synth                            # genera el CloudFormation sin desplegar
+make diff                             # que cambiaria en AWS
+make deploy-dev                       # despliega
+make destroy-dev                      # destruye (hazlo al acabar)
+```
+
+| Stack | Qué crea |
+|---|---|
+| `Practica-Dev-Network` | VPC 10.20.0.0/16, 2 AZ, solo subredes aisladas (sin NAT ni IGW), security groups de Glue y RDS, VPC endpoints |
+| `Practica-Dev-Storage` | Bucket `practica-datalake-dev-<cuenta>-<región>` y las tres bases del Glue Data Catalog |
+
+Dos detalles que merecen atención:
+
+- El security group de Glue **se permite a sí mismo todo el tráfico**. No es un
+  descuido: los nodos del cluster de Spark se hablan por puertos arbitrarios y
+  Glue lo exige. Sin esa regla el job se cuelga y falla por timeout sin decir
+  por qué.
+- Las bases del catálogo se **declaran**, no se descubren con un Crawler. Un
+  crawler cuesta en cada ejecución, tarda, y adivina el esquema.
+
+---
+
 ## Problemas conocidos
 
 ### `permission denied` en `/var/run/docker.sock`
@@ -141,7 +171,7 @@ gh pr create --base develop
 
 - [x] **Fase 0** — Git Flow, protección de ramas
 - [x] **Fase 1** — Entorno local: Docker, generador de datos, tooling
-- [ ] **Fase 2** — `feature/cdk-foundation`: VPC, S3, Glue Data Catalog
+- [x] **Fase 2** — `feature/cdk-foundation`: VPC sin NAT, bucket S3, Glue Data Catalog
 - [ ] **Fase 3** — `feature/rds-and-connection`: RDS + Glue Connection
 - [ ] **Fase 4** — `feature/bronze-ingest`: extracción incremental JDBC
 - [ ] **Fase 5** — `feature/silver-iceberg`: limpieza, dedup, MERGE, cuarentena
@@ -154,8 +184,31 @@ gh pr create --base develop
 
 ## Coste
 
-El diseño evita el **NAT Gateway** (~32 USD/mes) usando VPC Endpoints, y RDS
-`db.t4g.micro` entra en el free tier. Un run completo del pipeline cuesta unos
-0,05–0,15 USD en Glue.
+| Recurso | Coste si lo dejas desplegado |
+|---|---|
+| VPC, subredes, security groups | gratis |
+| Endpoint **Gateway** de S3 | gratis |
+| Endpoints de **interfaz** (Glue, Logs, Secrets, STS) | ~0,01 USD/h **por AZ** cada uno → **~29 USD/mes** en 1 AZ |
+| NAT Gateway | ~33 USD/mes — **no lo usamos** |
+| RDS `db.t4g.micro` | gratis los primeros 12 meses (free tier) |
+| S3 | céntimos a este volumen |
+| Glue 5.0 | 0,44 USD/DPU-hora, mínimo 2 DPU, facturación por minuto → ~0,05–0,15 USD por ejecución completa |
 
-**Ejecuta `make destroy-dev` al terminar cada sesión de trabajo.**
+Cuidado con la aritmética de los endpoints de interfaz: se paga **por endpoint y
+por AZ**. Cuatro endpoints en 2 AZ son ~58 USD/mes, más caro que el NAT Gateway
+que estamos evitando. Por eso `NetworkStack` los despliega en **una sola AZ**
+(el tráfico entre AZ de PrivateLink es gratis desde 2022) y se pueden apagar:
+
+```bash
+cdk deploy Practica-Dev-Network -c environment=dev -c interface_endpoints=false
+```
+
+Lo anterior solo importa si dejas la infraestructura levantada. La forma correcta
+de usar este laboratorio es destruirla al acabar, y entonces unas horas sueltas
+cuestan céntimos:
+
+```bash
+make destroy-dev
+```
+
+Configura además un **AWS Budget con alerta a 5 USD** antes de desplegar nada.
