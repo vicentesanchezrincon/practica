@@ -13,6 +13,7 @@ tienen ni un `if` de entorno dentro de la logica de negocio.
 
 from __future__ import annotations
 
+import glob
 import os
 
 from pyspark.sql import SparkSession
@@ -21,10 +22,30 @@ CATALOG = "glue_catalog"
 """Nombre del catalogo Iceberg. Se usa igual en local y en AWS:
 las consultas quedan como  SELECT * FROM glue_catalog.practica_dev_silver.customers"""
 
+LOCAL_JAR_GLOBS = (
+    "/usr/share/aws/iceberg/lib/iceberg-spark-runtime-*.jar",
+    "/usr/share/aws/glue-pds/jars/postgresql-*.jar",
+)
+"""La imagen de Glue trae estos JAR, pero fuera del classpath de Spark.
+
+En un job real los anade la propia plataforma (--datalake-formats iceberg para
+Iceberg, y el driver JDBC lo aporta la Glue Connection). En el contenedor local
+no hay nadie que lo haga, asi que los buscamos y los anadimos nosotros.
+Sin esto, el primer CREATE TABLE ... USING iceberg falla con ClassNotFoundException.
+"""
+
 
 def running_on_glue() -> bool:
     """En un job de Glue real esta variable siempre esta puesta."""
     return os.getenv("GLUE_INSTALLATION_PATH") is not None or os.getenv("--JOB_NAME") is not None
+
+
+def local_jars() -> list[str]:
+    """JAR que hay que anadir al classpath cuando corremos fuera de AWS."""
+    found = []
+    for pattern in LOCAL_JAR_GLOBS:
+        found.extend(sorted(glob.glob(pattern)))
+    return found
 
 
 def iceberg_conf(warehouse: str, *, on_glue: bool) -> dict[str, str]:
@@ -88,6 +109,8 @@ def build_session(
             .config("spark.sql.shuffle.partitions", "8")
             .config("spark.sql.session.timeZone", "UTC")
         )
+        if jars := local_jars():
+            builder = builder.config("spark.jars", ",".join(jars))
 
     for key, value in (extra_conf or {}).items():
         builder = builder.config(key, value)

@@ -138,4 +138,6 @@ def get_table(name: str) -> TableSpec:
     try:
         return TABLES[name]
     except KeyError:
-        raise KeyError(f"Tabla '{name}' no declarada en TABLES. Opciones: {sorted(TABLES)}") from None
+        raise KeyError(
+            f"Tabla '{name}' no declarada en TABLES. Opciones: {sorted(TABLES)}"
+        ) from None

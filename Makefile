@@ -1,10 +1,16 @@
 .DEFAULT_GOAL := help
 SHELL := /bin/bash
 
+# El contenedor necesita tu GID para poder escribir en el proyecto montado.
+export HOST_GID := $(shell id -g)
+
 COMPOSE := docker compose --env-file .env -f local/docker-compose.yml
 # Todo lo que sea PySpark se ejecuta DENTRO del contenedor de Glue,
 # para usar exactamente el mismo runtime que AWS.
-IN_GLUE := $(COMPOSE) exec -T glue
+#
+# "bash -lc" y no "bash -c": la imagen define SPARK_HOME, PATH y demas en el
+# perfil de login. Sin -l, spark-submit y pyspark no se encuentran.
+IN_GLUE := $(COMPOSE) exec -T glue bash -lc
 
 .PHONY: help
 help: ## Muestra esta ayuda
@@ -35,7 +41,7 @@ logs: ## Sigue los logs de los contenedores
 
 .PHONY: shell
 shell: ## Abre una bash dentro del contenedor de Glue
-	$(COMPOSE) exec glue bash
+	$(COMPOSE) exec glue bash -l
 
 # Las credenciales se leen de las variables que ya tiene el propio contenedor
 # de Postgres, asi no hay que mantenerlas sincronizadas en dos sitios.
@@ -53,21 +59,21 @@ schema: ## Aplica el DDL en el Postgres local
 
 .PHONY: seed
 seed: schema ## Carga historica inicial de datos sinteticos
-	$(IN_GLUE) python3 data_generator/seed.py --mode initial
+	$(IN_GLUE) 'python3 data_generator/seed.py --mode initial'
 
 .PHONY: seed-daily
 seed-daily: ## Simula un dia nuevo: inserts + updates + datos sucios
-	$(IN_GLUE) python3 data_generator/seed.py --mode daily
+	$(IN_GLUE) 'python3 data_generator/seed.py --mode daily'
 
 # ---------------------------------------------------------------- calidad ---
 
 .PHONY: test
 test: ## Tests unitarios (PySpark local, sin AWS)
-	$(IN_GLUE) python3 -m pytest tests/unit -m "not integration"
+	$(IN_GLUE) 'python3 -m pytest tests/unit -m "not integration"'
 
 .PHONY: test-integration
 test-integration: ## Tests de integracion (necesitan Postgres levantado)
-	$(IN_GLUE) python3 -m pytest tests/integration -m integration
+	$(IN_GLUE) 'python3 -m pytest tests/integration -m integration'
 
 .PHONY: lint
 lint: ## Comprueba estilo y formato

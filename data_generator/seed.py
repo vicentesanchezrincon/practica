@@ -25,7 +25,7 @@ import logging
 import os
 import random
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 
 import psycopg
 from faker import Faker
@@ -109,7 +109,7 @@ def dirty_country(dirt: DirtRates) -> str:
 def make_customers(fake: Faker, n: int, dirt: DirtRates, since: datetime) -> list[tuple]:
     rows = []
     for _ in range(n):
-        created = fake.date_time_between(start_date=since, tzinfo=timezone.utc)
+        created = fake.date_time_between(start_date=since, tzinfo=UTC)
         row = (
             dirty_email(fake, dirt),
             fake.first_name(),
@@ -130,7 +130,7 @@ def make_customers(fake: Faker, n: int, dirt: DirtRates, since: datetime) -> lis
 def make_products(fake: Faker, n: int, dirt: DirtRates, since: datetime) -> list[tuple]:
     rows = []
     for i in range(n):
-        created = fake.date_time_between(start_date=since, tzinfo=timezone.utc)
+        created = fake.date_time_between(start_date=since, tzinfo=UTC)
         price = round(random.uniform(3.0, 900.0), 2)
         if random.random() < dirt.negative_amount:
             price = -price
@@ -166,7 +166,7 @@ def make_orders(
             customer_id = None
 
         order_date = fake.date_between(start_date=start, end_date=end)
-        created = datetime.combine(order_date, datetime.min.time(), tzinfo=timezone.utc)
+        created = datetime.combine(order_date, datetime.min.time(), tzinfo=UTC)
         total = round(random.uniform(5.0, 2_500.0), 2)
         if random.random() < dirt.negative_amount:
             total = -total
@@ -188,15 +188,21 @@ def make_orders(
 
 def make_order_items(
     n_per_order: tuple[int, int],
-    order_ids: list[int],
+    orders: list[tuple[int, datetime]],
     product_ids: list[int],
     dirt: DirtRates,
 ) -> list[tuple]:
+    """Genera lineas de pedido.
+
+    `orders` son pares (order_id, created_at). La linea hereda el timestamp del
+    pedido padre: si le pusieramos now(), toda la tabla tendria el mismo
+    updated_at y la primera extraccion incremental se traeria el historico
+    entero en vez de solo lo que cambio ese dia.
+    """
     rows = []
-    now = datetime.now(timezone.utc)
-    max_order_id = max(order_ids) if order_ids else 0
+    max_order_id = max((oid for oid, _ in orders), default=0)
     lo, hi = n_per_order
-    for order_id in order_ids:
+    for order_id, created in orders:
         for _ in range(random.randint(lo, hi)):
             oid = order_id
             if random.random() < dirt.orphan_fk:
@@ -205,7 +211,17 @@ def make_order_items(
             price = round(random.uniform(3.0, 900.0), 2)
             if random.random() < dirt.negative_amount:
                 qty = -qty
-            rows.append((oid, random.choice(product_ids), qty, price, round(qty * price, 2), now, now))
+            rows.append(
+                (
+                    oid,
+                    random.choice(product_ids),
+                    qty,
+                    price,
+                    round(qty * price, 2),
+                    created,
+                    created,
+                )
+            )
     return rows
 
 
@@ -236,12 +252,12 @@ def max_id(conn: psycopg.Connection, table: str, pk: str) -> int:
         return cur.fetchone()[0]
 
 
-def fetch_ids_above(conn: psycopg.Connection, table: str, pk: str, threshold: int) -> list[int]:
-    """IDs creados despues de `threshold`. Sirve para recuperar exactamente las
-    filas que acabamos de insertar, sin depender de un ORDER BY random()."""
+def fetch_orders(conn: psycopg.Connection, above: int = 0) -> list[tuple[int, datetime]]:
+    """Pares (order_id, created_at). Con `above` se limita a los pedidos recien
+    insertados, sin depender de un ORDER BY random()."""
     with conn.cursor() as cur:
-        cur.execute(f"SELECT {pk} FROM {table} WHERE {pk} > %s", (threshold,))  # noqa: S608
-        return [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT order_id, created_at FROM orders WHERE order_id > %s", (above,))
+        return cur.fetchall()
 
 
 # ----------------------------------------------------------------- modos ----
@@ -263,7 +279,7 @@ def run_initial(conn: psycopg.Connection, fake: Faker, args: argparse.Namespace)
         cur.execute("TRUNCATE order_items, orders, products, customers RESTART IDENTITY CASCADE")
     conn.commit()
 
-    since = datetime.now(timezone.utc) - timedelta(days=args.history_days)
+    since = datetime.now(UTC) - timedelta(days=args.history_days)
 
     copy_rows(conn, "customers", CUSTOMER_COLS, make_customers(fake, args.customers, dirt, since))
     copy_rows(conn, "products", PRODUCT_COLS, make_products(fake, args.products, dirt, since))
@@ -274,8 +290,8 @@ def run_initial(conn: psycopg.Connection, fake: Faker, args: argparse.Namespace)
     day_range = (since.date(), date.today() - timedelta(days=1))
     copy_rows(conn, "orders", ORDER_COLS, make_orders(fake, args.orders, customer_ids, dirt, day_range))  # fmt: skip
 
-    order_ids = fetch_ids(conn, "orders", "order_id")
-    copy_rows(conn, "order_items", ITEM_COLS, make_order_items((1, 5), order_ids, product_ids, dirt))
+    orders = fetch_orders(conn)
+    copy_rows(conn, "order_items", ITEM_COLS, make_order_items((1, 5), orders, product_ids, dirt))
 
     summarise(conn)
 
@@ -293,7 +309,7 @@ def run_daily(conn: psycopg.Connection, fake: Faker, args: argparse.Namespace) -
     # --- altas ---
     n_new_customers = max(1, args.customers // 50)
     n_new_orders = max(1, args.orders // 30)
-    since = datetime.now(timezone.utc) - timedelta(days=1)
+    since = datetime.now(UTC) - timedelta(days=1)
 
     copy_rows(conn, "customers", CUSTOMER_COLS, make_customers(fake, n_new_customers, dirt, since))
     customer_ids = fetch_ids(conn, "customers", "customer_id")
@@ -303,8 +319,8 @@ def run_daily(conn: psycopg.Connection, fake: Faker, args: argparse.Namespace) -
     last_order_id = max_id(conn, "orders", "order_id")
     copy_rows(conn, "orders", ORDER_COLS, make_orders(fake, n_new_orders, customer_ids, dirt, (today, today)))  # fmt: skip
 
-    new_order_ids = fetch_ids_above(conn, "orders", "order_id", last_order_id)
-    copy_rows(conn, "order_items", ITEM_COLS, make_order_items((1, 4), new_order_ids, product_ids, dirt))  # fmt: skip
+    new_orders = fetch_orders(conn, above=last_order_id)
+    copy_rows(conn, "order_items", ITEM_COLS, make_order_items((1, 4), new_orders, product_ids, dirt))  # fmt: skip
 
     # --- modificaciones: el trigger mueve updated_at, asi que el incremental las vera ---
     with conn.cursor() as cur:

@@ -41,9 +41,7 @@ def test_se_puede_crear_y_leer_una_tabla_iceberg(spark):
     """La prueba que de verdad importa: Iceberg esta en el classpath y commitea."""
     spark.sql(f"CREATE DATABASE IF NOT EXISTS {CATALOG}.humo")
     spark.sql(f"DROP TABLE IF EXISTS {CATALOG}.humo.ping")
-    spark.sql(
-        f"CREATE TABLE {CATALOG}.humo.ping (id BIGINT, nombre STRING) USING iceberg"
-    )
+    spark.sql(f"CREATE TABLE {CATALOG}.humo.ping (id BIGINT, nombre STRING) USING iceberg")
     spark.sql(f"INSERT INTO {CATALOG}.humo.ping VALUES (1, 'uno'), (2, 'dos')")
 
     assert spark.table(f"{CATALOG}.humo.ping").count() == 2

@@ -43,8 +43,13 @@ por EventBridge.
 - `make`
 
 No necesitas Java ni Spark en tu máquina: todo corre dentro del contenedor
-oficial de Glue 5.0 (`public.ecr.aws/glue/aws-glue-libs:5`), que trae
-exactamente el mismo runtime que AWS (Spark 3.5.4, Python 3.11).
+oficial de Glue 5.0 (`public.ecr.aws/glue/aws-glue-libs:5`), que trae el mismo
+runtime que AWS. Verificado en la imagen: **Spark 3.5.2, Python 3.11.15,
+Iceberg 1.7.1-amzn-1**. (La documentación de AWS anuncia Spark 3.5.4; el tag
+`:5` va ligeramente por detrás.)
+
+`local/Dockerfile` extiende esa imagen con lo poco que le falta: `faker`,
+`psycopg` y `ruff`.
 
 ### Entorno local
 
@@ -77,6 +82,38 @@ Para probar que el gate de calidad detiene el pipeline:
 ```bash
 make shell
 python3 data_generator/seed.py --mode daily --dirt-factor 10
+```
+
+---
+
+## Problemas conocidos
+
+### `permission denied` en `/var/run/docker.sock`
+
+Te añadiste al grupo `docker` pero tu sesión de shell sigue con los grupos
+antiguos: `usermod -aG` no afecta a sesiones ya abiertas. Comprueba la diferencia:
+
+```bash
+id                    # ¿aparece "docker" aquí?
+getent group docker   # ¿apareces tú aquí?
+```
+
+Si estás en el segundo pero no en el primero, cierra sesión y vuelve a entrar
+(o reinicia). Para arreglarlo solo en la terminal actual, sin cerrar sesión:
+
+```bash
+newgrp docker
+```
+
+### El contenedor de Glue no puede escribir en el proyecto
+
+El usuario `hadoop` de la imagen es uid **10000**, distinto del tuyo. El
+`docker-compose.yml` lo resuelve arrancando el contenedor con tu GID
+(`user: "10000:${HOST_GID}"`), y el `Makefile` exporta `HOST_GID` por ti.
+Si lanzas `docker compose` a mano sin `make`, exporta la variable antes:
+
+```bash
+export HOST_GID=$(id -g)
 ```
 
 ---

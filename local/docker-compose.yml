@@ -33,11 +33,22 @@ services:
       - practica
 
   glue:
-    image: public.ecr.aws/glue/aws-glue-libs:5
+    # Imagen oficial de Glue 5.0 + faker/psycopg/ruff. Ver local/Dockerfile.
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: practica/glue-dev:5
     container_name: practica-glue
-    # Sin esto el contenedor arranca, no encuentra un job que ejecutar y muere.
-    # Lo mantenemos vivo para poder entrar con `make shell`.
-    command: ["sleep", "infinity"]
+    # El usuario "hadoop" de la imagen es uid 10000, pero tu proyecto montado
+    # pertenece a tu uid del host. Mantenemos el uid 10000 (para que /home/hadoop
+    # siga siendo suyo) y le damos TU gid, que es el que da permiso de escritura
+    # sobre los ficheros del repo. Sin esto, el contenedor no puede escribir en
+    # el volumen montado: fallan la cache de pytest, ruff y cualquier salida local.
+    user: "10000:${HOST_GID:-1000}"
+    # El ENTRYPOINT de la imagen es ["bash", "-l"], asi que lo que pongamos aqui
+    # son argumentos de bash, no un comando suelto: hay que pasar "-c".
+    # Sin esto el contenedor arranca, no tiene nada que hacer y muere.
+    command: ["-c", "sleep infinity"]
     environment:
       # Credenciales AWS: se leen del ~/.aws montado abajo (no las metas aqui)
       AWS_REGION: ${AWS_REGION:-eu-west-1}
