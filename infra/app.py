@@ -23,6 +23,8 @@ import aws_cdk as cdk
 # duplicar esas reglas aqui, importamos las mismas funciones que usan los jobs.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from stacks.database_stack import DatabaseStack  # noqa: E402
+from stacks.glue_stack import GlueStack  # noqa: E402
 from stacks.network_stack import NetworkStack  # noqa: E402
 from stacks.storage_stack import StorageStack  # noqa: E402
 
@@ -59,6 +61,35 @@ storage = StorageStack(
     env=env,
     description="Bucket del data lake (bronze/silver/gold) y bases del Glue Data Catalog",
 )
+
+database = DatabaseStack(
+    app,
+    f"{prefix}-Database",
+    environment=environment,
+    env=env,
+    vpc=network.vpc,
+    rds_security_group=network.rds_sg,
+    glue_security_group=network.glue_sg,
+    description="Postgres de origen en RDS y la Glue Connection que lo alcanza",
+)
+
+glue_stack = GlueStack(
+    app,
+    f"{prefix}-Glue",
+    environment=environment,
+    env=env,
+    bucket=storage.bucket,
+    secret=database.secret,
+    secret_name=database.secret_name,
+    connection_name=database.connection_name,
+    glue_security_group=network.glue_sg,
+    description="Rol de ejecucion y jobs de Glue",
+)
+
+# CloudFormation deduce casi todas las dependencias de las referencias cruzadas,
+# pero el job declara la Connection por nombre (un string), no por referencia.
+# Sin esta linea, Glue podria desplegarse antes de que la Connection exista.
+glue_stack.add_stack_dependency(database)
 
 # Etiquetas en todo lo que se cree: sin esto es imposible saber despues que
 # recurso de la factura pertenece a que proyecto.
