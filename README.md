@@ -175,6 +175,40 @@ Si estás en el segundo pero no en el primero, cierra sesión y vuelve a entrar
 newgrp docker
 ```
 
+### `DELETE_FAILED` al destruir el stack de red
+
+Síntoma: `make destroy-dev` deja `Practica-Dev-Network` en `DELETE_FAILED`, y el
+siguiente `make deploy-dev` se niega a continuar.
+
+```
+The following resource(s) failed to delete: [GlueSecurityGroup..., VpcisolatedSubnet1...]
+The subnet 'subnet-...' has dependencies and cannot be deleted
+```
+
+Causa: cuando un job de Glue corre dentro de la VPC, Glue crea ENIs en tu
+subred. Al destruir el stack, esas ENIs pueden sobrevivir unos minutos y
+bloquean el borrado de la subred y del security group.
+
+Diagnóstico:
+
+```bash
+aws ec2 describe-network-interfaces \
+  --filters "Name=vpc-id,Values=<vpc-id>" \
+  --query "NetworkInterfaces[].[NetworkInterfaceId,Status,Description]" --output text
+```
+
+Si aparecen en estado `available` con `Attached to Glue using role: ...`, están
+huérfanas: bórralas y reintenta.
+
+```bash
+aws ec2 delete-network-interface --network-interface-id eni-xxxxx
+aws cloudformation delete-stack --stack-name Practica-Dev-Network
+aws cloudformation wait stack-delete-complete --stack-name Practica-Dev-Network
+```
+
+Para evitarlo: espera unos minutos entre el último `start-job-run` y el
+`make destroy-dev`.
+
 ### El contenedor de Glue no puede escribir en el proyecto
 
 El usuario `hadoop` de la imagen es uid **10000**, distinto del tuyo. El

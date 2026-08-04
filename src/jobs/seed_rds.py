@@ -1,6 +1,6 @@
 """Job de Glue que siembra el RDS: aplica el DDL y carga los datos desde S3.
 
-Segunda mitad de la siembra. La primera es `data_generator/export_to_s3.py`,
+Segunda mitad de la siembra. La primera es `data_generator/export_seed.py`,
 que deja el Postgres local volcado en Parquet dentro del bucket.
 
 Este job corre DENTRO de la VPC (gracias a la Glue Connection), que es la unica
@@ -116,6 +116,7 @@ def main() -> None:
 
     # 3. Carga.
     total = 0
+    cargadas: dict[str, int] = {}
     for table in TABLES:
         origen = f"{args['SEED_PREFIX']}/{table}"
         df = spark.read.parquet(origen)
@@ -132,6 +133,7 @@ def main() -> None:
             .save()
         )
         log(f"{table:<12} {n:>8} filas cargadas")
+        cargadas[table] = n
         total += n
 
     # 4. Recolocar las secuencias.
@@ -146,7 +148,34 @@ def main() -> None:
     )
     execute_sql(spark, url, secret, setvals)
 
-    log(f"Listo: {total} filas en total.")
+    # 5. Verificacion: releer el estado final desde el RDS.
+    #
+    #    No basta con contar lo que hemos escrito. Si el TRUNCATE del paso 2
+    #    fallara, este job seguiria escribiendo el mismo numero de filas y el
+    #    log se veria identico, pero la tabla tendria el doble. La unica prueba
+    #    de que el job es idempotente es preguntarle a la base de datos cuantas
+    #    filas hay DESPUES.
+    log("Verificando contra el RDS")
+    problemas = []
+    for table in TABLES:
+        escritas = cargadas[table]
+        en_destino = (
+            spark.read.format("jdbc")
+            .option("url", url)
+            .option("dbtable", f"(SELECT count(*) AS n FROM {SCHEMA}.{table}) AS t")
+            .options(**props)
+            .load()
+            .collect()[0]["n"]
+        )
+        marca = "OK " if en_destino == escritas else "MAL"
+        log(f"  {marca} {table:<12} escritas={escritas:>7}  en_rds={en_destino:>7}")
+        if en_destino != escritas:
+            problemas.append(f"{table}: escritas {escritas}, en RDS {en_destino}")
+
+    if problemas:
+        raise RuntimeError("El RDS no coincide con lo cargado: " + "; ".join(problemas))
+
+    log(f"Listo: {total} filas en total, verificadas contra el RDS.")
     spark.stop()
 
 
