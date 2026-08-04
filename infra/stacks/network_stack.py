@@ -130,6 +130,15 @@ class NetworkStack(Stack):
             "SecretsManager": ec2.InterfaceVpcEndpointAwsService.SECRETS_MANAGER,
             # Asuncion de roles desde dentro de la VPC
             "Sts": ec2.InterfaceVpcEndpointAwsService.STS,
+            # Watermarks de la extraccion incremental (Fase 4).
+            #
+            # Alternativa considerada: guardarlos en S3, que ya tiene endpoint
+            # Gateway gratis. Se descarto porque la operacion que de verdad
+            # haces con un watermark es corregirlo a mano para reprocesar un
+            # dia, y `aws ssm put-parameter` es mucho mas comodo y menos
+            # peligroso que reescribir un objeto en el bucket del data lake.
+            # El precio de esa comodidad es este quinto endpoint.
+            "Ssm": ec2.InterfaceVpcEndpointAwsService.SSM,
         }
 
         self.interface_endpoints = {

@@ -105,7 +105,7 @@ make destroy-dev                      # destruye (hazlo al acabar)
 | `Practica-Dev-Network` | VPC 10.20.0.0/16, 2 AZ, solo subredes aisladas (sin NAT ni IGW), security groups de Glue y RDS, VPC endpoints |
 | `Practica-Dev-Storage` | Bucket `practica-datalake-dev-<cuenta>-<región>` y las tres bases del Glue Data Catalog |
 | `Practica-Dev-Database` | RDS Postgres 16.9 `db.t4g.micro` en subredes aisladas, credenciales en Secrets Manager, y la Glue Connection JDBC |
-| `Practica-Dev-Glue` | Rol de ejecución de Glue, publicación de los scripts a S3 y el job `seed-rds` |
+| `Practica-Dev-Glue` | Rol de ejecución de Glue, publicación de scripts a S3, y los jobs `seed-rds` y `bronze-ingest` |
 
 Dos detalles que merecen atención:
 
@@ -153,6 +153,61 @@ Detalles que merecen atención:
 - Después de cargar, el job **recoloca las secuencias**. Insertamos los IDs
   explícitamente, así que las secuencias seguirían en 1 y el primer `INSERT`
   que hiciera Postgres por su cuenta chocaría con una clave primaria existente.
+
+---
+
+## Capa Bronze: ingesta incremental
+
+```bash
+make bronze                      # ingesta todas las tablas
+make bronze TABLES=orders        # solo algunas
+make watermarks                  # hasta dónde llegó cada tabla
+```
+
+Escribe en `s3://<bucket>/bronze/ecommerce/<tabla>/ingestion_date=YYYY-MM-DD/`.
+
+**Regla de oro: Bronze no limpia nada.** Ni deduplica, ni castea, ni descarta
+filas malas. Es una copia fiel del origen. Si mañana cambias una regla de
+negocio, reprocesas Silver desde aquí sin volver a tocar producción.
+
+Lo único que se añade son columnas de linaje: `_ingested_at`, `_source_system`
+y `_batch_id` (el id del run de Glue, que permite rastrear cualquier fila hasta
+la ejecución que la trajo).
+
+### Cómo funciona el incremental
+
+Cada tabla guarda en SSM Parameter Store hasta qué `updated_at` llegó la última
+vez. La siguiente ejecución solo pide lo posterior.
+
+Dos decisiones que importan:
+
+- **El watermark avanza hasta el último `updated_at` leído de verdad**, no hasta
+  "ahora". Usar la hora actual dejaría fuera cualquier fila que se confirmara en
+  el origen mientras el job estaba leyendo — filas perdidas en silencio, el peor
+  bug posible en un pipeline.
+- **Se escribe solo al final.** Si el job falla después de escribir en S3, la
+  siguiente ejecución repite esas filas. Repetir es inofensivo (Bronze es
+  append-only y Silver deduplica); perder no.
+
+### Reprocesar un día
+
+Retrasa el watermark y vuelve a lanzar:
+
+```bash
+aws ssm put-parameter --overwrite --type String \
+  --name /practica/dev/watermark/orders \
+  --value 2026-01-01T00:00:00+00:00
+make bronze TABLES=orders
+```
+
+### Verificado en AWS
+
+| Prueba | Resultado |
+|---|---|
+| Carga inicial (watermark en epoch) | 349.009 filas |
+| Reejecución sin cambios | **0 filas** |
+| Tras un día de actividad simulada | **16.060 filas** — 4,5% de la tabla |
+| Lectura paralela | `order_items` con 4 particiones JDBC |
 
 ---
 
@@ -247,7 +302,7 @@ gh pr create --base develop
 - [x] **Fase 1** — Entorno local: Docker, generador de datos, tooling
 - [x] **Fase 2** — `feature/cdk-foundation`: VPC sin NAT, bucket S3, Glue Data Catalog
 - [x] **Fase 3** — `feature/rds-and-connection`: RDS + Glue Connection + siembra
-- [ ] **Fase 4** — `feature/bronze-ingest`: extracción incremental JDBC
+- [x] **Fase 4** — `feature/bronze-ingest`: extracción incremental por watermark
 - [ ] **Fase 5** — `feature/silver-iceberg`: limpieza, dedup, MERGE, cuarentena
 - [ ] **Fase 6** — `feature/gold-marts`: modelo estrella y SCD2
 - [ ] **Fase 7** — `feature/step-functions`: orquestación y gate de calidad
