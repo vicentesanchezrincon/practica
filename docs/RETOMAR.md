@@ -54,6 +54,11 @@ make export-seed && make seed-rds   # repoblar el RDS
 make bronze                         # ingesta a Bronze
 ```
 
+Los watermarks se borraron al cerrar la sesión, así que la primera `make bronze`
+de mañana será una carga completa. Si en algún momento Bronze te devuelve 0
+filas sin explicación después de un redespliegue, es que quedaron watermarks
+viejos: `make reset-watermarks`.
+
 **Al terminar cada sesión: `make destroy-dev`.**
 
 ---
@@ -151,6 +156,7 @@ Todas documentadas en el README, sección "Problemas conocidos":
 | `DELETE_FAILED` al destruir la red | las ENIs de Glue sobreviven al destroy y bloquean la subred |
 | Job de Glue con `ConnectTimeoutError` | falta el VPC endpoint de ese servicio |
 | Job de Glue colgado hasta timeout | el security group no se permite a sí mismo, o el rol no puede crear ENIs |
+| Bronze devuelve 0 filas tras redesplegar | los watermarks viven en SSM y sobreviven al `destroy` → `make reset-watermarks` |
 
 ---
 

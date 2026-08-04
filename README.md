@@ -264,6 +264,32 @@ aws cloudformation wait stack-delete-complete --stack-name Practica-Dev-Network
 Para evitarlo: espera unos minutos entre el último `start-job-run` y el
 `make destroy-dev`.
 
+### Bronze se queda vacío después de un `destroy` + `deploy`
+
+Síntoma: redespliegas, lanzas `make bronze` y trae **0 filas** sin dar ningún
+error. Bronze se queda vacío.
+
+Causa: los watermarks viven en SSM Parameter Store y **los crea el job, no
+CloudFormation**. `cdk destroy` no los toca. Al redesplegar, el bucket es nuevo
+y está vacío, pero los watermarks siguen diciendo "ya ingesté hasta ayer", así
+que el incremental no encuentra nada pendiente.
+
+Es la trampa de tener estado fuera de la infraestructura como código.
+
+Solución: bórralos antes de volver a empezar.
+
+```bash
+make reset-watermarks
+```
+
+O reprocesa desde una fecha concreta:
+
+```bash
+aws ssm put-parameter --overwrite --type String \
+  --name /practica/dev/watermark/orders \
+  --value 2026-01-01T00:00:00+00:00
+```
+
 ### El contenedor de Glue no puede escribir en el proyecto
 
 El usuario `hadoop` de la imagen es uid **10000**, distinto del tuyo. El

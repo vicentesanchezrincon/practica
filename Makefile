@@ -194,6 +194,15 @@ seed-rds: ## Lanza el job de Glue que siembra el RDS y espera a que acabe
 bronze: ## Ingesta incremental del RDS a la capa Bronze (TABLES=orders,... opcional)
 	$(call run_glue_job,bronze-ingest,$(if $(TABLES),--arguments '{"--TABLES":"$(TABLES)"}'))
 
+.PHONY: reset-watermarks
+reset-watermarks: ## Borra los watermarks: la proxima ingesta sera una carga completa
+	@NOMBRES=$$(aws ssm get-parameters-by-path --path /practica/$(ENV)/watermark \
+		--query 'Parameters[].Name' --output text); \
+	if [ -z "$$NOMBRES" ]; then echo "No hay watermarks que borrar."; else \
+	  aws ssm delete-parameters --names $$NOMBRES --query DeletedParameters --output text; \
+	  echo "Borrados. La proxima ingesta arrancara desde epoch."; \
+	fi
+
 .PHONY: watermarks
 watermarks: ## Muestra hasta donde llego la ultima ingesta de cada tabla
 	@aws ssm get-parameters-by-path --path /practica/$(ENV)/watermark \
