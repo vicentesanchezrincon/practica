@@ -97,6 +97,19 @@ format: ## Arregla estilo y formato
 ENV ?= dev
 CDK := cd infra && . .venv/bin/activate && cdk
 
+# Los jobs de Glue importan src/common, pero Glue no ejecuta codigo local: hay
+# que subirselo. --extra-py-files admite un .zip, asi que empaquetamos el
+# paquete entero. Se reconstruye si cambia cualquier fichero de src/common.
+build/common.zip: $(wildcard src/common/*.py)
+	@mkdir -p build
+	@find src/common -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
+	@rm -f build/common.zip
+	cd src && python3 -m zipfile -c ../build/common.zip common
+	@echo "Empaquetado build/common.zip"
+
+.PHONY: build-common
+build-common: build/common.zip ## Empaqueta src/common para los jobs de Glue
+
 infra/.venv: infra/requirements.txt
 	python3 -m venv infra/.venv
 	infra/.venv/bin/pip install --quiet --upgrade pip
@@ -111,15 +124,15 @@ test-infra: infra/.venv ## Tests de la infraestructura (sobre la plantilla, sin 
 	infra/.venv/bin/python -m pytest infra/tests -q
 
 .PHONY: synth
-synth: infra/.venv ## Genera el CloudFormation sin desplegar (ENV=dev|prod)
+synth: infra/.venv build/common.zip ## Genera el CloudFormation sin desplegar (ENV=dev|prod)
 	$(CDK) synth -c environment=$(ENV)
 
 .PHONY: diff
-diff: infra/.venv ## Muestra que cambiaria en AWS
+diff: infra/.venv build/common.zip ## Muestra que cambiaria en AWS
 	$(CDK) diff --all -c environment=$(ENV)
 
 .PHONY: deploy-dev
-deploy-dev: infra/.venv ## Despliega todos los stacks en dev
+deploy-dev: infra/.venv build/common.zip ## Despliega todos los stacks en dev
 	$(CDK) deploy --all -c environment=dev --require-approval never
 
 .PHONY: destroy-dev
@@ -148,22 +161,52 @@ export-seed: ## Exporta el Postgres local a Parquet y lo sube a S3
 	aws s3 sync data/_seed "s3://$(BUCKET)/_seed" --delete
 	@echo "Subido a s3://$(BUCKET)/_seed"
 
-.PHONY: seed-rds
-seed-rds: ## Lanza el job de Glue que siembra el RDS y espera a que acabe
-	@JOB=practica-$(ENV)-seed-rds; \
-	RUN=$$(aws glue start-job-run --job-name $$JOB --query JobRunId --output text); \
-	echo "Job $$JOB lanzado (run $$RUN). Esperando..."; \
+# Lanza un job de Glue, espera, y al terminar vuelca su salida.
+#
+# El `test -n` no es defensivo por gusto: si start-job-run falla (por ejemplo
+# con ConcurrentRunsExceededException), devuelve vacio, y sin esta comprobacion
+# el bucle se queda girando contra un run-id inexistente.
+define run_glue_job
+	@JOB=practica-$(ENV)-$(1); \
+	RUN=$$(aws glue start-job-run --job-name $$JOB $(2) --query JobRunId --output text) || exit 1; \
+	test -n "$$RUN" || { echo "No se pudo lanzar $$JOB"; exit 1; }; \
+	echo "$$JOB lanzado (run $$RUN)"; \
 	while true; do \
 	  ESTADO=$$(aws glue get-job-run --job-name $$JOB --run-id $$RUN --query JobRun.JobRunState --output text); \
 	  case $$ESTADO in \
-	    SUCCEEDED) echo "OK: $$ESTADO"; break;; \
-	    FAILED|ERROR|TIMEOUT|STOPPED) \
-	      echo "FALLO: $$ESTADO"; \
-	      aws glue get-job-run --job-name $$JOB --run-id $$RUN --query JobRun.ErrorMessage --output text; \
-	      exit 1;; \
-	    *) printf "  %s\r" $$ESTADO; sleep 15;; \
-	  esac; \
-	done
+	    SUCCEEDED) echo "OK: $$ESTADO";; \
+	    FAILED|ERROR|TIMEOUT|STOPPED) echo "FALLO: $$ESTADO"; \
+	      aws glue get-job-run --job-name $$JOB --run-id $$RUN --query JobRun.ErrorMessage --output text;; \
+	    *) printf "  %s\r" $$ESTADO; sleep 15; continue;; \
+	  esac; break; \
+	done; \
+	aws logs filter-log-events --log-group-name /aws-glue/jobs/output \
+	  --log-stream-names "$$RUN" --query 'events[].message' --output text 2>/dev/null \
+	  | tr '\t' '\n' | grep -E "^\s*\[" | sed 's/^\s*//' || true; \
+	test "$$ESTADO" = SUCCEEDED
+endef
+
+.PHONY: seed-rds
+seed-rds: ## Lanza el job de Glue que siembra el RDS y espera a que acabe
+	$(call run_glue_job,seed-rds)
+
+.PHONY: bronze
+bronze: ## Ingesta incremental del RDS a la capa Bronze (TABLES=orders,... opcional)
+	$(call run_glue_job,bronze-ingest,$(if $(TABLES),--arguments '{"--TABLES":"$(TABLES)"}'))
+
+.PHONY: reset-watermarks
+reset-watermarks: ## Borra los watermarks: la proxima ingesta sera una carga completa
+	@NOMBRES=$$(aws ssm get-parameters-by-path --path /practica/$(ENV)/watermark \
+		--query 'Parameters[].Name' --output text); \
+	if [ -z "$$NOMBRES" ]; then echo "No hay watermarks que borrar."; else \
+	  aws ssm delete-parameters --names $$NOMBRES --query DeletedParameters --output text; \
+	  echo "Borrados. La proxima ingesta arrancara desde epoch."; \
+	fi
+
+.PHONY: watermarks
+watermarks: ## Muestra hasta donde llego la ultima ingesta de cada tabla
+	@aws ssm get-parameters-by-path --path /practica/$(ENV)/watermark \
+		--query 'Parameters[].[Name,Value]' --output table
 
 .PHONY: db-creds
 db-creds: ## Muestra las credenciales del RDS (estan en Secrets Manager)

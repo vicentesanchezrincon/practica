@@ -59,8 +59,10 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-ecommerce}
       POSTGRES_USER: ${POSTGRES_USER:-practica}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-practica_local_only}
-      # Para que `import common...` y `import jobs...` funcionen sin instalar nada
-      PYTHONPATH: /home/hadoop/workspace/practica/src
+      # Para que `import common...` funcione sin instalar nada, y para que los
+      # tests puedan importar los jobs: `awsglue` viene en la imagen pero fuera
+      # del path por defecto de Python.
+      PYTHONPATH: /home/hadoop/workspace/practica/src:/usr/share/aws/glue-pds
       # Evita que Spark intente resolver el hostname del contenedor y falle
       SPARK_LOCAL_IP: 127.0.0.1
     volumes:

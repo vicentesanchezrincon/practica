@@ -16,6 +16,7 @@ Corren en el venv del host (necesitan aws-cdk-lib), no en el contenedor:
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -105,6 +106,37 @@ def test_se_pueden_apagar_los_endpoints_de_interfaz(network):
     assert interfaces == []
     # El de S3 es gratis, ese se queda siempre.
     sin_endpoints.resource_count_is("AWS::EC2::VPCEndpoint", 1)
+
+
+def test_hay_endpoint_para_cada_servicio_que_usan_los_jobs(network):
+    """En una VPC sin salida a internet, un servicio sin endpoint no existe.
+
+    Este test nacio de un fallo real: el job de Bronze murio con
+    `ConnectTimeoutError` contra ssm.eu-west-1.amazonaws.com porque se anadio
+    el watermark en SSM sin anadir su endpoint. El sintoma tarda dos minutos en
+    aparecer (timeout) y no dice que falte un endpoint.
+
+    Si un job empieza a usar un servicio nuevo de AWS, anadelo aqui Y a
+    NetworkStack. Este test es lo que fuerza a no olvidar la segunda parte.
+    """
+    servicios_que_usan_los_jobs = {
+        "s3",  # data lake y scripts
+        "glue",  # Data Catalog
+        "logs",  # sin esto depuras a ciegas
+        "secretsmanager",  # credenciales del RDS
+        "sts",  # asuncion de roles
+        "ssm",  # watermarks del incremental
+    }
+
+    declarados = set()
+    for endpoint in network.find_resources("AWS::EC2::VPCEndpoint").values():
+        nombre = json.dumps(endpoint["Properties"]["ServiceName"])
+        for servicio in servicios_que_usan_los_jobs:
+            if f".{servicio}" in nombre or f'"{servicio}"' in nombre:
+                declarados.add(servicio)
+
+    faltan = servicios_que_usan_los_jobs - declarados
+    assert not faltan, f"sin VPC endpoint: {sorted(faltan)} — los jobs fallaran por timeout"
 
 
 def test_el_sg_de_glue_se_permite_a_si_mismo(network):
