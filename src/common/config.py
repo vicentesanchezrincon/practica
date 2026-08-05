@@ -33,11 +33,47 @@ class TableSpec:
     """Columna numerica para paralelizar la lectura JDBC. Sin esto, Spark lee
     la tabla entera con un solo hilo y el job tarda una eternidad."""
 
+    # --- normalizacion (Silver) ---
+    # Se aplica ANTES de validar, para no mandar a cuarentena una fila cuyo
+    # unico problema era un espacio sobrante.
+
+    lower_trim: list[str] = field(default_factory=list)
+    """Columnas de texto a normalizar con trim + lower. Emails, sobre todo."""
+
+    upper_trim: list[str] = field(default_factory=list)
+    """trim + upper. Codigos de pais, divisas, SKUs."""
+
+    # --- validacion (Silver) ---
+
     not_null: list[str] = field(default_factory=list)
     non_negative: list[str] = field(default_factory=list)
 
+    patterns: dict[str, str] = field(default_factory=dict)
+    """{columna: regex}. Para lo que la normalizacion no puede arreglar: un
+    'ESP' donde se esperaba 'ES' no es un problema de formato, es un dato malo."""
+
     references: dict[str, tuple[str, str]] = field(default_factory=dict)
     """{columna_local: (tabla_padre, columna_padre)} para la integridad referencial."""
+
+    # --- escritura (Silver) ---
+
+    quarantine_threshold: float = 0.05
+    """Tasa de cuarentena tolerable para ESTA tabla, entre 0 y 1.
+
+    Es por tabla y no global porque no significan lo mismo: un 3% de clientes
+    con el email mal escrito es ruido normal de un formulario web; un 3% de
+    pedidos con importes negativos es un incidente.
+
+    Los valores actuales estan calibrados contra la suciedad que inyecta
+    data_generator/seed.py. En un proyecto real saldrian de la linea base
+    historica de cada tabla, no de una constante escrita a mano."""
+
+    silver_partition: str | None = None
+    """Transformacion de particion oculta de Iceberg, p. ej. months(order_date).
+
+    "Oculta" significa que quien consulta filtra por `order_date` y Iceberg
+    resuelve solo que particiones leer. En Hive tendrias que filtrar por la
+    columna de particion a mano, y todo el mundo se olvida."""
 
     @property
     def bronze_path_suffix(self) -> str:
@@ -52,28 +88,45 @@ class TableSpec:
         return " AND ".join(f"{target}.{k} = {source}.{k}" for k in self.business_key)
 
 
+EMAIL_PATTERN = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
+ISO_COUNTRY_PATTERN = r"^[A-Z]{2}$"
+
 TABLES: dict[str, TableSpec] = {
     "customers": TableSpec(
         name="customers",
         business_key=["customer_id"],
         partition_column="customer_id",
+        lower_trim=["email"],
+        upper_trim=["country_code"],
         not_null=["customer_id", "email"],
-        non_negative=[],
+        patterns={"email": EMAIL_PATTERN, "country_code": ISO_COUNTRY_PATTERN},
+        # Emails y paises mal tecleados: ruido esperable de un formulario.
+        quarantine_threshold=0.06,
     ),
     "products": TableSpec(
         name="products",
         business_key=["product_id"],
         partition_column="product_id",
+        upper_trim=["sku"],
+        lower_trim=["category"],
         not_null=["product_id", "sku"],
         non_negative=["unit_price"],
+        # El catalogo lo mantiene gente, no un formulario publico: se espera limpio.
+        quarantine_threshold=0.03,
     ),
     "orders": TableSpec(
         name="orders",
         business_key=["order_id"],
         partition_column="order_id",
+        lower_trim=["status"],
+        upper_trim=["currency"],
         not_null=["order_id", "customer_id", "order_date"],
         non_negative=["total_amount"],
         references={"customer_id": ("customers", "customer_id")},
+        # Un pedido mal formado es dinero que no cuadra: menos tolerancia.
+        quarantine_threshold=0.05,
+        # Los pedidos se consultan casi siempre por rango de fechas.
+        silver_partition="months(order_date)",
     ),
     "order_items": TableSpec(
         name="order_items",
@@ -85,6 +138,7 @@ TABLES: dict[str, TableSpec] = {
             "order_id": ("orders", "order_id"),
             "product_id": ("products", "product_id"),
         },
+        quarantine_threshold=0.05,
     ),
 }
 
@@ -96,8 +150,10 @@ de integridad referencial de Silver tenga contra que comparar."""
 # --------------------------------------------------------------- calidad ---
 
 QUARANTINE_THRESHOLD = 0.05
-"""Si mas del 5% de las filas de un lote acaban en cuarentena, el pipeline se
-para y no construye Gold. Mejor no publicar nada que publicar datos malos."""
+"""Umbral por defecto, para tablas que no declaren el suyo.
+
+Cada tabla puede afinarlo con `quarantine_threshold`. Si alguna lo supera, el
+pipeline se detiene y Gold no se construye sobre un lote sospechoso."""
 
 
 # ------------------------------------------------------------- ubicaciones ---

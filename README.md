@@ -105,7 +105,7 @@ make destroy-dev                      # destruye (hazlo al acabar)
 | `Practica-Dev-Network` | VPC 10.20.0.0/16, 2 AZ, solo subredes aisladas (sin NAT ni IGW), security groups de Glue y RDS, VPC endpoints |
 | `Practica-Dev-Storage` | Bucket `practica-datalake-dev-<cuenta>-<región>` y las tres bases del Glue Data Catalog |
 | `Practica-Dev-Database` | RDS Postgres 16.9 `db.t4g.micro` en subredes aisladas, credenciales en Secrets Manager, y la Glue Connection JDBC |
-| `Practica-Dev-Glue` | Rol de ejecución de Glue, publicación de scripts a S3, y los jobs `seed-rds` y `bronze-ingest` |
+| `Practica-Dev-Glue` | Rol de ejecución de Glue, publicación de scripts a S3, y los jobs `seed-rds`, `bronze-ingest` y `silver-transform` |
 
 Dos detalles que merecen atención:
 
@@ -211,6 +211,134 @@ make bronze TABLES=orders
 
 ---
 
+## Capa Silver: limpieza y MERGE sobre Iceberg
+
+```bash
+make silver                  # procesa la partición de hoy
+make silver FULL=1           # reprocesa todo el histórico de Bronze
+make silver TABLES=orders    # solo algunas tablas
+make quality                 # último informe de calidad
+```
+
+Escribe en tablas **Iceberg** dentro de `glue_catalog.practica_dev_silver`, que
+**se registran solas en el Glue Data Catalog** — Silver queda consultable desde
+Athena sin trabajo extra.
+
+### El orden importa
+
+1. **Normaliza** (`trim`, `lower`, `upper`). Va *antes* de validar, para no
+   mandar a cuarentena una fila cuyo único problema era un espacio sobrante.
+   Lo que no se arregla adivinando: un `ESP` no se convierte en `ES`.
+2. **Deduplica** por clave de negocio con `row_number()`, quedándose con la
+   versión más reciente. Desempata por `_ingested_at`, sin lo cual el resultado
+   dependería del orden en que Spark leyera los ficheros.
+3. **Valida** contra las reglas declaradas en `src/common/config.py`.
+4. **`MERGE INTO`** la tabla Iceberg.
+
+### Cuarentena, no descarte
+
+Las filas que fallan la validación van a `silver/_quarantine/<tabla>/` con
+`_quality_errors`: un array con **todos** sus problemas, no solo el primero.
+Si un pedido tiene el importe negativo *y* el cliente huérfano, te enteras de
+las dos cosas a la vez.
+
+Descartar filas en silencio es la forma más rápida de perder la confianza en un
+data lake: los números no cuadran y nadie sabe por qué.
+
+### La integridad referencial se valida contra el origen, no contra Silver
+
+Detalle sutil con consecuencias grandes. Una clave foránea se considera huérfana
+solo si apunta a algo que **nunca existió en el origen** — no si apunta a algo
+que no sobrevivió a la limpieza.
+
+La primera versión comparaba contra la tabla Silver ya fusionada, y provocaba un
+efecto dominó medido con los datos de prueba:
+
+```
+   628 clientes a cuarentena (email nulo, país mal formado)
+         ↓ dejaban huérfanos
+ 3.253 pedidos  (además de los 2.541 con problemas propios)
+         ↓ dejaban huérfanas
+19.303 líneas de pedido
+```
+
+Un 1% de huérfanos reales se convertía en un **10%** de cuarentena. Casi 7× de
+amplificación, y la tasa dejaba de significar nada.
+
+El arreglo **no toca Bronze** — Bronze sigue siendo una copia tonta e inmutable.
+Lo que cambia es contra qué se compara: el universo de claves vistas en el
+origen (todo el lote, incluidas las filas que van a cuarentena) unido al
+histórico ya en Silver.
+
+| | Antes | Ahora |
+|---|---|---|
+| `order_items` en cuarentena | 9,95% | **2,03%** |
+| Total | 8,76% (el gate saltaba) | **2,55%** |
+
+La contrapartida, que hay que conocer: **Silver ya no es referencialmente
+cerrada**. Puede haber un pedido cuyo `customer_id` no esté en
+`silver.customers` porque ese cliente está en cuarentena. Gold lo resolverá con
+un `LEFT JOIN` contra una dimensión "desconocido", que es exactamente lo que se
+hace en un modelo estrella real.
+
+### El gate de calidad
+
+Cada tabla declara **su propio umbral** en `TableSpec`, porque no significan lo
+mismo: un 3% de clientes con el email mal escrito es ruido normal de un
+formulario web; un 3% de productos con precio negativo es un incidente.
+
+| Tabla | Umbral | Medido |
+|---|---|---|
+| `customers` | 6% | 3,02% |
+| `products` | 3% | 1,45% |
+| `orders` | 5% | 3,99% |
+| `order_items` | 5% | 2,03% |
+
+Si alguna lo supera, el job **falla**. Ojo con qué significa eso exactamente:
+el `MERGE` ocurre antes de la comprobación y solo escribe filas válidas, así que
+Silver no queda corrupta. Lo que impide el fallo es que **Gold se construya
+sobre un lote del que se ha rechazado demasiado**: no es "hay datos malos
+publicados", es "se ha perdido tanto que los agregados no serían
+representativos".
+
+El resultado se deja además en `s3://<bucket>/_quality/silver/latest.json`, que
+es lo que leerá la máquina de estados de la Fase 7.
+
+Para probarlo, ensucia un lote a propósito:
+
+```bash
+make shell
+python3 data_generator/seed.py --mode daily --dirt-factor 10
+```
+
+### Reglas declarativas
+
+Añadir una tabla al pipeline es añadir una entrada a `TABLES`, sin tocar código
+de Spark:
+
+```python
+"customers": TableSpec(
+    business_key=["customer_id"],
+    lower_trim=["email"],
+    upper_trim=["country_code"],
+    not_null=["customer_id", "email"],
+    patterns={"country_code": r"^[A-Z]{2}$"},
+    quarantine_threshold=0.06,
+),
+```
+
+### Consultar Silver desde Athena
+
+Las tablas Iceberg **se registran solas en el Glue Data Catalog**, así que no
+hace falta declararlas ni pasar un crawler:
+
+```sql
+SELECT count(*) FROM practica_dev_silver.orders;
+SELECT * FROM practica_dev_silver.customers LIMIT 10;
+```
+
+---
+
 ## Problemas conocidos
 
 ### `permission denied` en `/var/run/docker.sock`
@@ -229,6 +357,31 @@ Si estás en el segundo pero no en el primero, cierra sesión y vuelve a entrar
 ```bash
 newgrp docker
 ```
+
+### `ruff`/`pytest` fallan al escribir un fichero concreto
+
+Síntoma: `make format` deja un fichero sin reformatear y `make lint` sigue
+quejándose del mismo, una y otra vez.
+
+Causa: ese fichero se creó dentro de una shell abierta con `newgrp docker`, así
+que heredó el grupo **`docker`** en vez del tuyo. El contenedor corre con tu GID
+real, no con el de docker, y no puede escribirlo.
+
+```bash
+ls -l el/fichero.py     # ¿el grupo es "docker"?
+```
+
+Solución, y comprobación de que no quedan más:
+
+```bash
+find . -path ./.git -prune -o -path ./infra/.venv -prune -o ! -group $(id -gn $(id -un)) -print
+find . -path ./.git -prune -o -path ./infra/.venv -prune -o ! -group $(id -gn $(id -un)) \
+  -exec chgrp $(id -gn $(id -un)) {} +
+```
+
+Para evitarlo: crea y edita ficheros del proyecto desde una terminal normal, no
+desde una abierta con `newgrp docker`. Mejor aún, cierra sesión y vuelve a
+entrar una vez para que el grupo `docker` sea permanente y no necesites `newgrp`.
 
 ### `DELETE_FAILED` al destruir el stack de red
 
@@ -329,7 +482,7 @@ gh pr create --base develop
 - [x] **Fase 2** — `feature/cdk-foundation`: VPC sin NAT, bucket S3, Glue Data Catalog
 - [x] **Fase 3** — `feature/rds-and-connection`: RDS + Glue Connection + siembra
 - [x] **Fase 4** — `feature/bronze-ingest`: extracción incremental por watermark
-- [ ] **Fase 5** — `feature/silver-iceberg`: limpieza, dedup, MERGE, cuarentena
+- [x] **Fase 5** — `feature/silver-iceberg`: limpieza, dedup, MERGE, cuarentena
 - [ ] **Fase 6** — `feature/gold-marts`: modelo estrella y SCD2
 - [ ] **Fase 7** — `feature/step-functions`: orquestación y gate de calidad
 - [ ] **Fase 8** — `feature/ci-cd`: GitHub Actions con OIDC

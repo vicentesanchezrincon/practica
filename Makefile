@@ -194,6 +194,15 @@ seed-rds: ## Lanza el job de Glue que siembra el RDS y espera a que acabe
 bronze: ## Ingesta incremental del RDS a la capa Bronze (TABLES=orders,... opcional)
 	$(call run_glue_job,bronze-ingest,$(if $(TABLES),--arguments '{"--TABLES":"$(TABLES)"}'))
 
+.PHONY: silver
+silver: ## Limpia Bronze y hace MERGE sobre Silver (FULL=1 para todo el historico)
+	$(call run_glue_job,silver-transform,$(if $(FULL),--arguments '{"--FULL_REFRESH":"true"}',$(if $(TABLES),--arguments '{"--TABLES":"$(TABLES)"}')))
+
+.PHONY: quality
+quality: ## Muestra el ultimo informe de calidad de Silver
+	@aws s3 cp "s3://$(BUCKET)/_quality/silver/latest.json" - 2>/dev/null | python3 -m json.tool \
+		|| echo "Todavia no hay informe. Lanza 'make silver'."
+
 .PHONY: reset-watermarks
 reset-watermarks: ## Borra los watermarks: la proxima ingesta sera una carga completa
 	@NOMBRES=$$(aws ssm get-parameters-by-path --path /practica/$(ENV)/watermark \

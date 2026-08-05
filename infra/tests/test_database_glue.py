@@ -176,6 +176,44 @@ def test_el_job_usa_la_connection(dev):
     )
 
 
+def test_solo_los_jobs_que_hablan_con_el_rds_llevan_connection(dev):
+    """Meter un job en la VPC cuando no lo necesita solo anade formas de
+    fallar: ENIs que crear, endpoints de los que depender y arranques mas
+    lentos. Silver solo lee S3 y el catalogo, asi que corre fuera."""
+    _, glue_stack = dev
+    con_connection = set()
+    sin_connection = set()
+    for job in glue_stack.find_resources("AWS::Glue::Job").values():
+        nombre = job["Properties"]["Name"]
+        if job["Properties"].get("Connections"):
+            con_connection.add(nombre)
+        else:
+            sin_connection.add(nombre)
+
+    assert "practica-dev-seed-rds" in con_connection
+    assert "practica-dev-bronze-ingest" in con_connection
+    assert "practica-dev-silver-transform" in sin_connection
+
+
+def test_el_job_de_silver_carga_las_librerias_de_iceberg(dev):
+    """Sin --datalake-formats, los JAR de Iceberg no estan en el classpath y el
+    primer CREATE TABLE ... USING iceberg falla."""
+    _, glue_stack = dev
+    jobs = glue_stack.find_resources("AWS::Glue::Job")
+    silver = next(j for j in jobs.values() if j["Properties"]["Name"].endswith("silver-transform"))
+    assert silver["Properties"]["DefaultArguments"]["--datalake-formats"] == "iceberg"
+
+
+def test_todos_los_jobs_reciben_el_paquete_comun(dev):
+    """Glue no ve el codigo del repositorio. Sin --extra-py-files, cualquier
+    `import common.algo` revienta nada mas arrancar."""
+    _, glue_stack = dev
+    for job in glue_stack.find_resources("AWS::Glue::Job").values():
+        assert "--extra-py-files" in job["Properties"]["DefaultArguments"], job["Properties"][
+            "Name"
+        ]
+
+
 def test_el_job_usa_glue_5(dev):
     _, glue_stack = dev
     glue_stack.has_resource_properties("AWS::Glue::Job", {"GlueVersion": "5.0"})
