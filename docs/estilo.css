@@ -1,0 +1,122 @@
+/* Hoja de estilo de los dos documentos PDF del proyecto.
+ *
+ * Esto NO es CSS para web: no hay `@media print` por ningun lado porque el
+ * destino es siempre la impresora. Todo esta en puntos y milimetros, no en
+ * pixeles, y las reglas que mas importan son las de salto de pagina.
+ *
+ * Las fuentes DejaVu no van embebidas: se piden por nombre al sistema. Si
+ * generas el PDF en una maquina sin ellas, el texto se sustituye y la
+ * paginacion cambia. Chrome si las incrusta en el PDF resultante, asi que el
+ * fichero final se ve igual en cualquier sitio.
+ */
+
+@page { size: A4; margin: 18mm 16mm 20mm 16mm; }
+
+html { font-size: 10.5pt; }
+body {
+  font-family: "DejaVu Serif", Georgia, serif;
+  color: #1a1a1a; line-height: 1.55; margin: 0;
+  hyphens: auto;
+}
+
+h1, h2, h3, h4 { font-family: "DejaVu Sans", Helvetica, Arial, sans-serif; color: #0d2b45; line-height: 1.25; }
+/* Cada capitulo empieza en pagina nueva. */
+h1 { font-size: 20pt; border-bottom: 3px solid #0d2b45; padding-bottom: 6px; margin: 0 0 18px; page-break-before: always; }
+h1.nobreak, .portada h1, .toc h1 { page-break-before: avoid; }
+h2 { font-size: 14pt; margin: 22px 0 8px; border-left: 5px solid #2f6690; padding-left: 9px; }
+h3 { font-size: 11.5pt; margin: 16px 0 5px; color: #2f6690; }
+h4 { font-size: 10.5pt; margin: 12px 0 4px; color: #444; }
+/* Un titulo solo al final de la pagina, con su texto en la siguiente, es el
+ * defecto tipografico mas visible de un documento generado. */
+h1, h2, h3, h4 { page-break-after: avoid; }
+p { margin: 0 0 8px; text-align: justify; }
+
+code, pre, .mono { font-family: "DejaVu Sans Mono", "Courier New", monospace; }
+code { font-size: 0.86em; background: #eef2f6; padding: 1px 4px; border-radius: 3px; }
+pre {
+  background: #f6f8fa; border: 1px solid #d8dee4; border-left: 4px solid #2f6690;
+  padding: 8px 10px; font-size: 8.2pt; line-height: 1.4; overflow-wrap: break-word;
+  white-space: pre-wrap; page-break-inside: avoid; margin: 8px 0 12px; border-radius: 3px;
+}
+pre code { background: none; padding: 0; font-size: inherit; }
+
+table { border-collapse: collapse; width: 100%; margin: 10px 0 14px; font-size: 9pt; }
+tr { page-break-inside: avoid; }
+/* Repite la cabecera cuando una tabla se parte entre paginas. */
+thead { display: table-header-group; }
+th, td { border: 1px solid #c9d3dc; padding: 5px 7px; text-align: left; vertical-align: top; }
+th { background: #e3ebf2; font-family: "DejaVu Sans", Arial, sans-serif; font-size: 8.6pt; }
+td code { font-size: 0.9em; }
+tr:nth-child(even) td { background: #fafbfc; }
+
+ul, ol { margin: 0 0 10px; padding-left: 22px; }
+li { margin-bottom: 4px; }
+
+/* Listas de definicion: el formato natural del glosario. En Markdown:
+ *
+ *     Termino
+ *     :   Definicion.
+ */
+dl { margin: 0 0 12px; }
+dt {
+  font-family: "DejaVu Sans", Helvetica, Arial, sans-serif;
+  font-weight: bold; color: #0d2b45; margin: 12px 0 2px;
+  page-break-after: avoid;
+}
+dd { margin: 0 0 6px 20px; }
+dd p { margin-bottom: 6px; }
+
+blockquote {
+  margin: 10px 0 14px; padding: 2px 14px; border-left: 4px solid #c9d3dc;
+  color: #444; font-size: 9.6pt; page-break-inside: avoid;
+}
+blockquote p { margin-bottom: 4px; }
+
+hr { border: none; border-top: 1px solid #d8dee4; margin: 18px 0; }
+
+/* Los tres avisos. En Markdown se escriben con la extension `admonition`:
+ *
+ *     !!! nota "Titulo opcional"
+ *         Cuerpo del aviso, indentado.
+ */
+.admonition, .nota, .aviso, .clave {
+  padding: 8px 12px; margin: 10px 0 14px; border-radius: 4px; font-size: 9.4pt;
+  page-break-inside: avoid;
+}
+.nota  { background: #eef5fb; border-left: 4px solid #2f6690; }
+.aviso { background: #fdf3e7; border-left: 4px solid #d68910; }
+.clave { background: #eef8f0; border-left: 4px solid #2e8b57; }
+.admonition-title {
+  font-family: "DejaVu Sans", Arial, sans-serif; font-weight: bold;
+  margin: 0 0 4px; color: #0d2b45;
+}
+.nota b, .aviso b, .clave b { font-family: "DejaVu Sans", Arial, sans-serif; }
+.admonition p:last-child { margin-bottom: 0; }
+
+/* Siglas: en negrita y sin partir nunca de linea. */
+.sigla { font-weight: bold; font-family: "DejaVu Sans", Arial, sans-serif; white-space: nowrap; }
+
+.portada { text-align: center; padding-top: 55mm; page-break-after: always; }
+.portada h1 { border: none; font-size: 30pt; margin-bottom: 4px; }
+.portada .sub { font-size: 13pt; color: #2f6690; margin-bottom: 40px; }
+.portada .meta { font-size: 10pt; color: #666; margin-top: 60px; line-height: 1.9; }
+.portada hr { width: 45%; border: none; border-top: 1px solid #c9d3dc; margin: 26px auto; }
+
+/* Indice. Lo genera la extension `toc` de python-markdown a partir de los
+ * encabezados, asi que no puede desincronizarse del cuerpo. */
+.toc { page-break-after: always; }
+.toc ul { list-style: none; padding-left: 0; }
+.toc > ul > li {
+  font-family: "DejaVu Sans", Arial, sans-serif; font-size: 10pt;
+  margin: 7px 0 3px; font-weight: bold; color: #0d2b45;
+}
+.toc ul ul { padding-left: 20px; font-weight: normal; font-size: 9pt; color: #444; }
+.toc ul ul li { margin: 2px 0; }
+.toc ul ul ul { display: none; }  /* tres niveles en el indice es ruido */
+.toc a { color: inherit; text-decoration: none; }
+
+/* Diagramas de caracteres: mas pequenos para que quepa el ancho. */
+.ascii, pre.ascii { font-size: 7.6pt; line-height: 1.25; }
+
+/* Enlaces: en papel el color no sirve de nada, pero en el PDF en pantalla si. */
+a { color: #2f6690; }

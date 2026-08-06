@@ -1,0 +1,6 @@
+# Dependencias para generar los PDF de docs/. Se instalan en docs/.venv con
+# `make docs-deps`, igual que las del CDK viven en infra/.venv.
+#
+# Van aparte del pyproject a proposito: generar documentacion no es parte del
+# pipeline y nadie deberia necesitar esto para ejecutar los jobs o los tests.
+markdown>=3.7

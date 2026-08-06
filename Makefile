@@ -97,6 +97,23 @@ lint: ## Comprueba estilo y formato
 format: ## Arregla estilo y formato
 	$(IN_GLUE) 'ruff check --fix . && ruff format .'
 
+# ---------------------------------------------------------- documentacion ---
+# Corre en el HOST, no en el contenedor: quien convierte el HTML en PDF es
+# Chrome, y Chrome esta en tu maquina.
+
+docs/.venv: docs/requirements.txt
+	python3 -m venv docs/.venv
+	docs/.venv/bin/pip install --quiet --upgrade pip
+	docs/.venv/bin/pip install --quiet -r docs/requirements.txt
+	@touch docs/.venv
+
+.PHONY: docs-deps
+docs-deps: docs/.venv ## Crea/actualiza el venv de la documentacion
+
+.PHONY: docs
+docs: docs/.venv ## Genera los PDF de proyecto y glosario desde los .md
+	docs/.venv/bin/python docs/build_docs.py $(DOC)
+
 # -------------------------------------------------------------- despliegue ---
 # El CDK corre en el HOST (no en el contenedor): necesita el CLI de node y tus
 # credenciales AWS. Los jobs de Spark corren en el contenedor. Son dos mundos.
