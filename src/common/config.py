@@ -1,14 +1,28 @@
 """Configuracion declarativa del pipeline.
 
-Un solo sitio define, por tabla: la clave de negocio, la columna de watermark
-y las reglas de calidad. Los tres jobs (bronze, silver, gold) leen de aqui,
-asi que anadir una tabla nueva al pipeline es anadir una entrada a TABLES,
-no tocar codigo de Spark.
+Un solo sitio define, por tabla: de donde se saca, cual es su clave de negocio
+y que reglas de calidad tiene que cumplir. Los tres jobs (bronze, silver, gold)
+leen de aqui, asi que anadir una tabla al pipeline es anadir una entrada a
+TABLES, no tocar codigo de Spark.
+
+Hay dos cosas distintas en juego y conviene no mezclarlas:
+
+  * **Como se OBTIENE** una tabla  -> `SourceSpec` y sus subclases.
+    Es especifico del tipo de origen: una watermark y una columna de particion
+    son conceptos de una lectura JDBC y no significan nada en un fichero.
+  * **Como se VALIDA** una tabla   -> el resto de `TableSpec`.
+    Es igual para cualquier origen: un email mal escrito lo esta viniera de
+    donde viniera.
+
+Hasta la Fase 9 esas dos cosas vivian juntas en `TableSpec`, y no se notaba
+porque todos los origenes eran la misma tabla Postgres con `updated_at`. Con un
+segundo tipo de origen la costura salta a la vista.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 SOURCE_SYSTEM = "postgres_ecommerce"
 SOURCE_SCHEMA = "ecommerce"
@@ -18,13 +32,47 @@ SOURCE_SCHEMA = "ecommerce"
 LINEAGE_PREFIX = "_"
 
 
-@dataclass(frozen=True)
-class TableSpec:
-    """Como se ingesta y se valida una tabla del origen."""
+# ------------------------------------------------------------------ origen ---
 
-    name: str
-    business_key: list[str]
-    """Clave real de negocio. Es la que usa el MERGE de Silver, no la PK tecnica."""
+
+@dataclass(frozen=True)
+class SourceSpec:
+    """De donde sale una tabla. Una subclase por tipo de origen.
+
+    Se modela con subclases y no con un campo `kind` mas un monton de opciones
+    opcionales porque asi **los estados invalidos no se pueden ni escribir**:
+    con un unico dataclass seria posible declarar `kind="jdbc"` sin opciones de
+    JDBC, y eso solo reventaria en ejecucion.
+
+    `kind` es un ClassVar (no un campo) para que siga siendo un string
+    greppable con el que despachar en los jobs, sin poder contradecir a la clase.
+    """
+
+    kind: ClassVar[str] = "?"
+
+    system: str = SOURCE_SYSTEM
+    """Identificador del sistema de origen. Va a la columna de linaje
+    `_source_system`, que es lo que responde "¿de donde salio esta fila?"
+    cuando en el lake hay datos de varios sitios."""
+
+    @property
+    def bronze_namespace(self) -> str:
+        """Carpeta bajo `bronze/` que agrupa las tablas de este origen.
+
+        En JDBC es el esquema de la base de datos. Manteniendo el nombre del
+        origen en la ruta, dos tablas que se llamen igual en sistemas distintos
+        no se pisan.
+        """
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class JdbcSource(SourceSpec):
+    """Tabla leida por JDBC, de forma incremental por watermark."""
+
+    kind: ClassVar[str] = "jdbc"
+
+    schema: str = SOURCE_SCHEMA
 
     watermark_column: str = "updated_at"
     """Columna que usa la extraccion incremental. Debe tener indice en origen."""
@@ -32,6 +80,23 @@ class TableSpec:
     partition_column: str | None = None
     """Columna numerica para paralelizar la lectura JDBC. Sin esto, Spark lee
     la tabla entera con un solo hilo y el job tarda una eternidad."""
+
+    @property
+    def bronze_namespace(self) -> str:
+        return self.schema
+
+
+# ------------------------------------------------------------------ reglas ---
+
+
+@dataclass(frozen=True)
+class TableSpec:
+    """Como se ingesta y se valida una tabla del origen."""
+
+    name: str
+    source: SourceSpec
+    business_key: list[str]
+    """Clave real de negocio. Es la que usa el MERGE de Silver, no la PK tecnica."""
 
     # --- normalizacion (Silver) ---
     # Se aplica ANTES de validar, para no mandar a cuarentena una fila cuyo
@@ -75,9 +140,24 @@ class TableSpec:
     resuelve solo que particiones leer. En Hive tendrias que filtrar por la
     columna de particion a mano, y todo el mundo se olvida."""
 
+    # --- puentes de compatibilidad, se retiran al final de la Fase 10 ---
+    # Existen para que este commit sea un refactor puro: reestructura los datos
+    # sin tocar ni una linea de los jobs ni de los tests. Si algo se rompe al
+    # quitarlos, se sabe que lo rompio quitar el puente y no la reestructura.
+
+    @property
+    def watermark_column(self) -> str:
+        """OBSOLETO: usar `spec.source.watermark_column`. Solo existe en JDBC."""
+        return self.source.watermark_column  # type: ignore[attr-defined]
+
+    @property
+    def partition_column(self) -> str | None:
+        """OBSOLETO: usar `spec.source.partition_column`. Solo existe en JDBC."""
+        return self.source.partition_column  # type: ignore[attr-defined]
+
     @property
     def bronze_path_suffix(self) -> str:
-        return f"{SOURCE_SCHEMA}/{self.name}"
+        return f"{self.source.bronze_namespace}/{self.name}"
 
     @property
     def silver_table(self) -> str:
@@ -94,8 +174,8 @@ ISO_COUNTRY_PATTERN = r"^[A-Z]{2}$"
 TABLES: dict[str, TableSpec] = {
     "customers": TableSpec(
         name="customers",
+        source=JdbcSource(partition_column="customer_id"),
         business_key=["customer_id"],
-        partition_column="customer_id",
         lower_trim=["email"],
         upper_trim=["country_code"],
         not_null=["customer_id", "email"],
@@ -105,8 +185,8 @@ TABLES: dict[str, TableSpec] = {
     ),
     "products": TableSpec(
         name="products",
+        source=JdbcSource(partition_column="product_id"),
         business_key=["product_id"],
-        partition_column="product_id",
         upper_trim=["sku"],
         lower_trim=["category"],
         not_null=["product_id", "sku"],
@@ -116,8 +196,8 @@ TABLES: dict[str, TableSpec] = {
     ),
     "orders": TableSpec(
         name="orders",
+        source=JdbcSource(partition_column="order_id"),
         business_key=["order_id"],
-        partition_column="order_id",
         lower_trim=["status"],
         upper_trim=["currency"],
         not_null=["order_id", "customer_id", "order_date"],
@@ -130,8 +210,8 @@ TABLES: dict[str, TableSpec] = {
     ),
     "order_items": TableSpec(
         name="order_items",
+        source=JdbcSource(partition_column="order_item_id"),
         business_key=["order_item_id"],
-        partition_column="order_item_id",
         not_null=["order_item_id", "order_id", "product_id"],
         non_negative=["quantity", "unit_price", "line_amount"],
         references={
@@ -182,7 +262,7 @@ class Layout:
         return f"s3://{self.bucket}/silver/_quarantine"
 
     def bronze_table(self, table: str) -> str:
-        return f"{self.bronze}/{SOURCE_SCHEMA}/{table}"
+        return f"{self.bronze}/{get_table(table).bronze_path_suffix}"
 
 
 def catalog_database(layer: str, environment: str = "dev") -> str:
