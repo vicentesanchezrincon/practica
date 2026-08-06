@@ -355,7 +355,7 @@ make pipeline    # bronze -> silver -> gold de una tacada
 | `fct_order_items` | Los hechos, a grano de **línea de pedido** |
 | `agg_daily_sales` | Ingresos, unidades y ticket medio por día y categoría |
 
-Los conceptos están explicados en [docs/GLOSARIO.md](GLOSARIO.md).
+Los conceptos están explicados en [docs/glosario.md](docs/glosario.md).
 
 ### El grano
 
@@ -611,6 +611,35 @@ gh variable set DESPLIEGUE_AUTOMATICO_DEV --body true
 Es una variable y no un cambio en el YAML a propósito: se activa o se revierte
 en segundos, sin PR y sin protección de rama de por medio. Esta infraestructura
 cuesta ~0,05 USD/hora, y un merge no debería poder resucitarla sin que lo pidas.
+
+---
+
+## Documentación
+
+Dos documentos, con propósitos distintos, escritos en Markdown y generados a PDF:
+
+| Fuente | Sale | Qué contiene |
+|---|---|---|
+| [docs/proyecto.md](docs/proyecto.md) | `documentacion-practica.pdf` | **Este** proyecto: arquitectura, decisiones, problemas vividos, las 9 fases |
+| [docs/glosario.md](docs/glosario.md) | `glosario.pdf` | Conceptos reutilizables: siglas, arquitecturas, modelado, modos de fallo |
+
+La frontera es *caso concreto vs patrón general*. «Se eligió Iceberg porque…»
+va al documento del proyecto; «qué es un table format y en qué se diferencian
+Iceberg, Delta y Hudi» va al glosario. Un incidente vivido aparece en los dos,
+con enfoques distintos.
+
+```bash
+make docs          # genera los dos PDF
+make docs DOC=glosario
+```
+
+La cadena es Markdown → HTML → PDF con Chrome headless. Markdown y no HTML a
+mano por tres razones: los documentos se leen en GitHub sin generar nada, los
+diff de un PR son legibles, y **el índice lo genera la herramienta** — el que
+había escrito a mano llevaba tiempo desincronizado del cuerpo.
+
+Los PDF y el HTML intermedio están en `.gitignore`: son megabytes de binario que
+se regeneran en cada edición, y el hook `check-added-large-files` los rechazaría.
 
 ---
 

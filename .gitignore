@@ -34,6 +34,13 @@ infra/.venv/
 *.pem
 credentials
 
+# Documentacion generada. Las FUENTES (docs/*.md, docs/estilo.css,
+# docs/build_docs.py) si se versionan; los productos no: son megabytes de
+# binario que se regeneran en cada edicion, y el hook check-added-large-files
+# de pre-commit los rechazaria de todas formas. Se reconstruyen con `make docs`.
+docs/*.html
+docs/*.pdf
+
 # Editores
 .idea/
 .vscode/
