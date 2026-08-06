@@ -1,0 +1,92 @@
+# Entorno de desarrollo local.
+#
+#   postgres -> hace de sistema origen (lo que en AWS sera RDS)
+#   glue     -> runtime identico al de AWS Glue 5.0 (Spark 3.5.4, Python 3.11)
+#
+# Levantar:  make up
+# Entrar:    make shell
+#
+# Ojo: en Glue 5.0 el usuario por defecto del contenedor es "hadoop"
+# (en Glue 4.0 era "glue_user"). Los paths dentro del contenedor cuelgan
+# de /home/hadoop.
+
+name: practica
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: practica-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ecommerce}
+      POSTGRES_USER: ${POSTGRES_USER:-practica}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-practica_local_only}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-practica} -d ${POSTGRES_DB:-ecommerce}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - practica
+
+  glue:
+    # Imagen oficial de Glue 5.0 + faker/psycopg/ruff. Ver local/Dockerfile.
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: practica/glue-dev:5
+    container_name: practica-glue
+    # El usuario "hadoop" de la imagen es uid 10000, pero tu proyecto montado
+    # pertenece a tu uid del host. Mantenemos el uid 10000 (para que /home/hadoop
+    # siga siendo suyo) y le damos TU gid, que es el que da permiso de escritura
+    # sobre los ficheros del repo. Sin esto, el contenedor no puede escribir en
+    # el volumen montado: fallan la cache de pytest, ruff y cualquier salida local.
+    user: "10000:${HOST_GID:-1000}"
+    # El ENTRYPOINT de la imagen es ["bash", "-l"], asi que lo que pongamos aqui
+    # son argumentos de bash, no un comando suelto: hay que pasar "-c".
+    # Sin esto el contenedor arranca, no tiene nada que hacer y muere.
+    command: ["-c", "sleep infinity"]
+    environment:
+      # Credenciales AWS: se leen del ~/.aws montado abajo (no las metas aqui)
+      AWS_REGION: ${AWS_REGION:-eu-west-1}
+      AWS_PROFILE: ${AWS_PROFILE:-default}
+      # Datos de conexion al Postgres de al lado
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-ecommerce}
+      POSTGRES_USER: ${POSTGRES_USER:-practica}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-practica_local_only}
+      # Para que `import common...` funcione sin instalar nada, y para que los
+      # tests puedan importar los jobs: `awsglue` viene en la imagen pero fuera
+      # del path por defecto de Python.
+      PYTHONPATH: /home/hadoop/workspace/practica/src:/usr/share/aws/glue-pds
+      # Evita que Spark intente resolver el hostname del contenedor y falle
+      SPARK_LOCAL_IP: 127.0.0.1
+    volumes:
+      # El proyecto entero, en caliente: editas en tu IDE y se ve dentro
+      - ..:/home/hadoop/workspace/practica
+      # Credenciales AWS en solo lectura
+      - ${HOME}/.aws:/home/hadoop/.aws:ro
+      # Cache de dependencias Maven, para no re-descargar los JAR en cada arranque
+      - ivy_cache:/home/hadoop/.ivy2
+    working_dir: /home/hadoop/workspace/practica
+    ports:
+      - "4040:4040"   # Spark UI del job en ejecucion
+      - "18080:18080" # Spark History Server
+      - "8888:8888"   # Jupyter, si lo arrancas
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - practica
+
+volumes:
+  postgres_data:
+  ivy_cache:
+
+networks:
+  practica:
+    driver: bridge
