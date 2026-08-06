@@ -354,30 +354,45 @@ def build_fct_order_items(
 # ---------------------------------------------------------- agg_daily_sales ---
 
 
-def build_agg_daily_sales(spark: SparkSession, environment: str, fct: DataFrame) -> DataFrame:
-    """Ingresos, unidades y ticket medio por dia y categoria.
+def agregar_ventas_diarias(fct: DataFrame, dim_product: DataFrame) -> DataFrame:
+    """Solo el calculo: entra un DataFrame, sale un DataFrame.
 
-    El ticket medio divide entre PEDIDOS DISTINTOS, no entre lineas. Dividir
-    entre lineas daria el importe medio por linea, que es otra cosa y siempre
-    sale mas bajo. Es el error de agregacion mas comun al pasar de un hecho de
-    cabecera a uno de linea.
+    Esta separado de `build_agg_daily_sales` por un motivo concreto: la version
+    1.0.0 salio con el ticket medio dividido entre LINEAS y nadie lo vio, porque
+    no habia forma de probar este calculo sin levantar un catalogo Iceberg
+    entero. Un calculo que no se puede probar en tres lineas es un calculo que
+    se volvera a romper.
+
+    **El ticket medio divide entre PEDIDOS DISTINTOS, no entre lineas.** Dividir
+    entre lineas da el importe medio por linea, que es otra cosa y siempre sale
+    mas bajo: exactamente en la proporcion pedidos/lineas. Es el error de
+    agregacion mas comun al pasar de un hecho de cabecera a uno de linea, y no
+    da ningun error: el job termina bien, el esquema es correcto y el numero
+    esta mal. Ver tests/unit/test_gold_agg.py.
     """
-    dim_product = spark.table(gold_name(environment, "dim_product")).select(
-        "product_key", "category"
-    )
-
-    agg = (
+    return (
         fct.join(dim_product, on="product_key", how="left")
         .groupBy(F.col("order_date").alias("sale_date"), "category")
         .agg(
             F.sum("line_amount").alias("revenue"),
             F.sum("quantity").alias("units"),
+            # countDistinct cuesta un shuffle extra, si. Es el precio de que el
+            # numero signifique lo que dice significar.
             F.countDistinct("order_id").alias("orders"),
             F.count("*").alias("lines"),
         )
         .withColumn("avg_ticket", F.round(F.col("revenue") / F.col("orders"), 2))
         .withColumn("revenue", F.round(F.col("revenue"), 2))
     )
+
+
+def build_agg_daily_sales(spark: SparkSession, environment: str, fct: DataFrame) -> DataFrame:
+    """Ingresos, unidades y ticket medio por dia y categoria."""
+    dim_product = spark.table(gold_name(environment, "dim_product")).select(
+        "product_key", "category"
+    )
+
+    agg = agregar_ventas_diarias(fct, dim_product)
 
     full = gold_name(environment, "agg_daily_sales")
     replace_table(agg, full, partition="months(sale_date)")

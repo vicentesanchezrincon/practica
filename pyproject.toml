@@ -1,6 +1,6 @@
 [project]
 name = "practica"
-version = "0.1.0"
+version = "1.0.1"
 description = "Pipeline medallion Postgres -> S3 con AWS Glue, PySpark y Step Functions"
 readme = "README.md"
 requires-python = ">=3.11"
