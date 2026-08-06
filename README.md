@@ -519,6 +519,101 @@ La causa del corte fue `orders` al 7,69% frente a su umbral del 5%.
 
 ---
 
+## CI/CD
+
+Tres workflows en `.github/workflows/`:
+
+| Workflow | Cuándo | Qué hace |
+|---|---|---|
+| `ci.yml` | cada PR y cada push a `develop`/`main` | lint, 97 tests unitarios, 65 de infraestructura y `cdk synth` |
+| `deploy-dev.yml` | push a `develop` / manual | `cdk diff` siempre; despliega solo si se lo pides |
+| `deploy-prod.yml` | push a `main` / manual | igual, más aprobación manual obligatoria |
+
+### Sin claves de acceso: OIDC
+
+Lo habitual es crear un usuario IAM, sacarle una clave y pegarla en los secrets
+del repositorio. Esa clave no caduca, vive en un sistema de terceros y no hay
+forma de saber quién la ha copiado.
+
+Con OIDC no hay clave que guardar. GitHub firma un token de vida cortísima que
+describe quién ejecuta qué, AWS lo valida contra el certificado público de
+GitHub y devuelve credenciales temporales.
+
+**La línea que lo sostiene todo es la condición sobre el claim `sub`.** El
+emisor y el `aud` son idénticos para *todos* los repositorios de GitHub. Si el
+trust policy solo comprobara esos dos, cualquiera podría crear un repositorio,
+copiar el ARN del rol —que está escrito en el workflow, y **este repo es
+público**—, pedir `id-token: write` y entrar en la cuenta. En CloudTrail se
+vería un `AssumeRoleWithWebIdentity` perfectamente legítimo.
+
+Y el error opuesto, igual de común: `repo:owner/repo:*`. Ese comodín incluye los
+`pull_request`, y el token de un PR se emite contra el repositorio base, así que
+un PR desde un fork desplegaría con tu rol. Los valores van **enumerados y
+literales**, y hay un test que lo comprueba.
+
+**El rol de prod confía en `environment:prod`, no en `refs/heads/main`.** Ese
+claim solo aparece si el job declara `environment: prod`, que es lo único que
+dispara la regla de revisor obligatorio. Aceptando también la rama, un job sin
+`environment:` desplegaría producción saltándose la aprobación: la puerta
+seguiría pintada en la interfaz sin cerrar nada.
+
+**El rol no despliega nada por sí mismo**: solo sabe asumir los roles que creó
+`cdk bootstrap`. Colgarle `AdministratorAccess` funcionaría igual de bien y
+convertiría un push malicioso a `develop` en control total de la cuenta.
+
+### El CI no puede quedarse verde mintiendo
+
+`tests/conftest.py` y seis ficheros de test usan `pytest.importorskip("pyspark")`.
+En tu portátil es una comodidad. En un runner sin el contenedor de Glue es una
+mentira: un *skip* de colección no cambia el código de salida, así que pytest
+termina en 0, el check sale verde y se han ejecutado 20 de los 97 tests.
+
+Por eso el job corre dentro de `public.ecr.aws/glue/aws-glue-libs:5` —el mismo
+runtime que AWS, y el único sitio donde están los JAR de Iceberg— y lleva
+`PRACTICA_EXIGE_PYSPARK=1`, que convierte cualquier salto en fallo. Se comprueba
+así:
+
+```bash
+python3 -m pytest tests/unit -m "not integration"      # verde, saltando 63 tests
+PRACTICA_EXIGE_PYSPARK=1 python3 -m pytest tests/unit  # error, exit 4
+make test-ci                                           # 97 passed en el contenedor
+```
+
+### Puesta en marcha (una sola vez)
+
+El stack de OIDC es el huevo y la gallina: hay que desplegarlo a mano, porque
+hasta que exista no hay rol que permita desplegar desde Actions. No pertenece a
+ningún entorno, es gratis y **no debe borrarse** con `make destroy-dev`: por eso
+solo se construye con `-c cicd=true` y así queda fuera del `--all`.
+
+```bash
+make diff-cicd          # revisa el trust policy A MANO antes de crear nada
+make deploy-cicd        # OIDC_EXISTENTE=1 si tu cuenta ya tiene el proveedor
+
+REPO=vicentesanchezrincon/practica
+gh variable set AWS_REGION --repo $REPO --body eu-west-1
+gh secret set AWS_ROLE_DEV_ARN --repo $REPO --body "arn:aws:iam::<cuenta>:role/practica-github-dev"
+```
+
+El ARN va como *secret* y no como *variable* porque lleva dentro el id de
+cuenta y el repositorio es público.
+
+### El interruptor de coste
+
+Al mergear en `develop`, el workflow solo ejecuta `cdk diff`: lee AWS y cuenta
+qué cambiaría, sin crear nada. El despliegue real hay que pedirlo. Para pasar a
+despliegue continuo de verdad:
+
+```bash
+gh variable set DESPLIEGUE_AUTOMATICO_DEV --body true
+```
+
+Es una variable y no un cambio en el YAML a propósito: se activa o se revierte
+en segundos, sin PR y sin protección de rama de por medio. Esta infraestructura
+cuesta ~0,05 USD/hora, y un merge no debería poder resucitarla sin que lo pidas.
+
+---
+
 ## Problemas conocidos
 
 ### `permission denied` en `/var/run/docker.sock`
@@ -665,7 +760,7 @@ gh pr create --base develop
 - [x] **Fase 5** — `feature/silver-iceberg`: limpieza, dedup, MERGE, cuarentena
 - [x] **Fase 6** — `feature/gold-marts`: modelo estrella y SCD2
 - [x] **Fase 7** — `feature/step-functions`: orquestación y gate de calidad
-- [ ] **Fase 8** — `feature/ci-cd`: GitHub Actions con OIDC
+- [x] **Fase 8** — `feature/ci-cd`: GitHub Actions con OIDC
 - [ ] **Fase 9** — `release/1.0.0` y ejercicio de hotfix
 
 ---

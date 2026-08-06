@@ -80,6 +80,13 @@ test: ## Tests unitarios (PySpark local, sin AWS)
 test-integration: ## Tests de integracion (necesitan Postgres levantado)
 	$(IN_GLUE) 'python3 -m pytest tests/integration -m integration'
 
+# Lo mismo que `test`, pero exigiendo que PySpark e Iceberg esten de verdad.
+# Es lo que ejecuta el CI. Sin la variable, un entorno sin PySpark se salta 63
+# de los 91 tests EN SILENCIO y termina en verde. Ver tests/conftest.py.
+.PHONY: test-ci
+test-ci: ## Tests unitarios como los corre el CI (falla si falta PySpark en vez de saltarlos)
+	$(IN_GLUE) 'PRACTICA_EXIGE_PYSPARK=1 python3 -m pytest tests/unit -m "not integration"'
+
 # ruff vive en el contenedor (ver local/Dockerfile), no en el host: asi todo el
 # mundo usa la misma version sin instalar nada.
 .PHONY: lint
@@ -119,8 +126,13 @@ infra/.venv: infra/requirements.txt
 .PHONY: infra-deps
 infra-deps: infra/.venv ## Crea/actualiza el venv del CDK
 
+# build/common.zip es prerequisito de verdad, no adorno: test_database_glue.py y
+# test_orchestration.py construyen el GlueStack, que hace
+# s3deploy.Source.asset(build/). Sin ese directorio el synth revienta con
+# "Cannot find asset". En tu maquina no se nota porque build/ existe desde la
+# primera vez que desplegaste; en un clon limpio o en un runner de CI, nunca.
 .PHONY: test-infra
-test-infra: infra/.venv ## Tests de la infraestructura (sobre la plantilla, sin tocar AWS)
+test-infra: infra/.venv build/common.zip ## Tests de la infraestructura (sobre la plantilla, sin tocar AWS)
 	infra/.venv/bin/python -m pytest infra/tests -q
 
 .PHONY: synth
@@ -135,9 +147,31 @@ diff: infra/.venv build/common.zip ## Muestra que cambiaria en AWS
 deploy-dev: infra/.venv build/common.zip ## Despliega todos los stacks en dev
 	$(CDK) deploy --all -c environment=dev --require-approval never
 
+.PHONY: deploy-prod
+deploy-prod: infra/.venv build/common.zip ## Despliega todos los stacks en prod
+	$(CDK) deploy --all -c environment=prod --require-approval never \
+		$(if $(ALERT_EMAIL),-c alert_email=$(ALERT_EMAIL))
+
 .PHONY: destroy-dev
 destroy-dev: infra/.venv ## Destruye los stacks de dev (hazlo al acabar cada sesion)
 	$(CDK) destroy --all -c environment=dev --force
+
+# ------------------------------------------------------------------- CI/CD ---
+# El stack de OIDC se despliega A MANO y una sola vez. No entra en deploy-dev ni
+# en destroy-dev: es gratis (solo IAM) y sin el no hay CI. Ver el comentario de
+# infra/app.py sobre por que se instancia solo con -c cicd=true.
+#
+# OIDC_EXISTENTE=1 si tu cuenta ya tiene el proveedor de GitHub creado por otro
+# proyecto: una cuenta admite uno solo por URL.
+CICD_FLAGS := -c cicd=true $(if $(OIDC_EXISTENTE),-c oidc_existente=true)
+
+.PHONY: diff-cicd
+diff-cicd: infra/.venv ## Que cambiaria en el stack de CI/CD (revisa el trust policy AQUI)
+	$(CDK) diff Practica-Cicd $(CICD_FLAGS)
+
+.PHONY: deploy-cicd
+deploy-cicd: infra/.venv ## Despliega el proveedor OIDC y los roles de GitHub Actions (una vez)
+	$(CDK) deploy Practica-Cicd $(CICD_FLAGS) --require-approval never
 
 # --------------------------------------------------------- siembra del RDS ---
 # El RDS esta en subredes aisladas: no lo alcanzas con psql. El camino es

@@ -1,0 +1,67 @@
+# Despliegue de produccion.
+#
+# Igual que deploy-dev.yml salvo en una cosa, y esa cosa es todo el sentido de
+# este fichero: el job declara `environment: prod`.
+name: Deploy prod
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # ------------------------------------------------------------------
+    # `environment: prod` hace DOS cosas a la vez, y las dos hacen falta:
+    #
+    #   1. activa la regla de revisor obligatorio del GitHub Environment: el
+    #      job se queda esperando a que alguien apruebe;
+    #   2. mete el claim `environment:prod` en el token OIDC, y ese claim es lo
+    #      UNICO que acepta el trust policy del rol de produccion (ver
+    #      infra/stacks/cicd_stack.py).
+    #
+    # Si se te olvida esta linea, el despliegue no se salta la aprobacion:
+    # falla con "Not authorized to perform sts:AssumeRoleWithWebIdentity".
+    # Falla cerrado, que es como tiene que fallar una puerta.
+    # ------------------------------------------------------------------
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Este secret esta definido EN EL ENTORNO prod, no en el repositorio:
+          # un job que no declare `environment: prod` ni siquiera puede leerlo.
+          # Defensa en profundidad, y gratis.
+          role-to-assume: ${{ secrets.AWS_ROLE_PROD_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-deploy-prod-${{ github.run_id }}
+
+      - run: npm install -g aws-cdk@2
+      - run: pip install -r infra/requirements.txt
+      - run: make build-common
+
+      - name: Que cambiaria en produccion
+        run: make diff ENV=prod
+
+      - name: Desplegar
+        if: github.event_name == 'workflow_dispatch' || vars.DESPLIEGUE_AUTOMATICO_PROD == 'true'
+        # En prod si interesa la suscripcion de correo del topic de alertas: si
+        # la puerta de calidad corta un lote de madrugada, alguien tiene que
+        # enterarse sin mirar la consola.
+        run: make deploy-prod ALERT_EMAIL="${{ secrets.ALERT_EMAIL }}"

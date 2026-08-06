@@ -1,0 +1,121 @@
+# Integracion continua: se ejecuta en cada PR y en cada push a las ramas
+# protegidas.
+#
+# Este workflow NO toca AWS y no debe poder hacerlo. No pide `id-token`, no
+# asume ningun rol y no lee ningun secret. Todo lo que comprueba se comprueba en
+# frio, sobre el codigo y sobre la plantilla de CloudFormation.
+name: CI
+
+on:
+  pull_request:
+    branches: [develop, main]
+  # Tambien en push: si algo se cuela por un merge, o alguien edita un fichero
+  # desde la web de GitHub, quiero enterarme igual.
+  push:
+    branches: [develop, main]
+
+permissions:
+  contents: read
+
+# Empujar dos veces seguidas a un PR no deja dos CI compitiendo.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# NINGUN job lleva filtro `paths:`. Un job que es requisito de merge y que se
+# salta por rutas deja el PR colgado para siempre en "Expected - waiting for
+# status to be reported", sin forma de desbloquearlo salvo quitar la proteccion.
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Se ejecuta pre-commit y no `ruff` suelto: asi la version de ruff sale
+      # del .pre-commit-config.yaml y no hay dos fuentes de verdad. Con un
+      # `pip install ruff` acabarias con una version en tu portatil y otra
+      # distinta en el CI, y con el CI en rojo por reglas que tu hook local
+      # nunca te llego a ensenar.
+      - run: pipx run pre-commit run --all-files --show-diff-on-failure
+        env:
+          # `no-commit-to-branch` mira en que rama estas. En un push a develop
+          # fallaria... por estar en develop, que es exactamente lo que se
+          # espera de un push a develop. Ese hook protege commits locales, no
+          # el CI.
+          SKIP: no-commit-to-branch
+
+  tests-glue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Los tests corren DENTRO de la imagen de Glue, la misma que usa AWS.
+    #
+    # Las alternativas se descartaron por razones concretas:
+    #   * instalar pyspark en el runner no vale: src/jobs/*.py importan
+    #     `awsglue.utils`, que no esta en PyPI, y los JAR de Iceberg tendrian
+    #     que venir de Maven en vez de ser los de Glue 5.0. Si un dia divergen,
+    #     el CI diria verde y el job real fallaria, que es el fallo mas caro que
+    #     existe en este proyecto;
+    #   * correr solo los tests de logica pura es justo el problema que este
+    #     workflow existe para arreglar.
+    # El precio son ~2-3 minutos de descarga de imagen. Aceptable.
+    container:
+      image: public.ecr.aws/glue/aws-glue-libs:5
+      # El usuario por defecto de la imagen es `hadoop` (uid 10000), pero
+      # GitHub monta el workspace como root. Sin esto, Spark no puede escribir
+      # metastore_db/ ni derby.log en el directorio de trabajo y la suite muere
+      # con un "permission denied" que no menciona los permisos por ningun
+      # lado. Es el problema inverso al de local/docker-compose.yml, donde hay
+      # que bajar al gid del host porque alli los ficheros son tuyos.
+      options: --user root
+    env:
+      # `awsglue` viene en la imagen pero fuera del path por defecto de Python.
+      # `src/` ya lo anade pytest por la configuracion de pyproject.toml.
+      PYTHONPATH: /usr/share/aws/glue-pds
+      SPARK_LOCAL_IP: 127.0.0.1
+      # La linea que convierte un skip silencioso en un CI rojo. Ver el
+      # razonamiento completo en tests/conftest.py.
+      PRACTICA_EXIGE_PYSPARK: "1"
+    steps:
+      - uses: actions/checkout@v4
+      # Se invoca pytest directamente y no `make test-ci`: `make` no esta
+      # garantizado en la imagen base. El target existe para reproducir esto
+      # mismo en local.
+      - run: python3 -m pytest tests/unit -m "not integration"
+
+  infra:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r infra/requirements.txt
+      # build/ esta en .gitignore: en un runner NO existe. GlueStack hace
+      # s3deploy.Source.asset(build/) y el synth muere con "Cannot find asset"
+      # antes de ejecutar un solo test.
+      - run: make build-common
+      - run: python -m pytest infra/tests -q
+
+      - name: cdk synth (sin credenciales)
+        # Los tests de infraestructura importan los stacks y construyen su
+        # propio cdk.App: NADIE ejecuta infra/app.py. Un parametro renombrado en
+        # el cableado, una dependencia entre stacks mal puesta o un NameError
+        # ahi pasarian los 65 tests y romperian el primer despliegue. Esto lo
+        # cubre en 20 segundos.
+        run: cd infra && npx --yes aws-cdk@2 synth -c environment=dev --quiet
+        env:
+          AWS_DEFAULT_REGION: eu-west-1
+          # CDK_DEFAULT_ACCOUNT no se define A PROPOSITO.
+          #
+          # Con una cuenta concreta, NetworkStack resuelve sus zonas de
+          # disponibilidad por el context provider `availability-zones`, que
+          # llama a EC2 de verdad. Sin credenciales eso falla, y la cache
+          # (infra/cdk.context.json) esta en .gitignore porque el repo es
+          # publico y ahi vive el id de cuenta.
+          #
+          # Sin cuenta, el stack queda agnostico y la VPC usa Fn::GetAZs, que
+          # resuelve el propio CloudFormation. Es decir: este synth vale
+          # precisamente porque NO sabe en que cuenta esta.
