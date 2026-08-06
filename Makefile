@@ -198,6 +198,13 @@ bronze: ## Ingesta incremental del RDS a la capa Bronze (TABLES=orders,... opcio
 silver: ## Limpia Bronze y hace MERGE sobre Silver (FULL=1 para todo el historico)
 	$(call run_glue_job,silver-transform,$(if $(FULL),--arguments '{"--FULL_REFRESH":"true"}',$(if $(TABLES),--arguments '{"--TABLES":"$(TABLES)"}')))
 
+.PHONY: gold
+gold: ## Construye el modelo estrella en Gold
+	$(call run_glue_job,gold-build)
+
+.PHONY: pipeline
+pipeline: bronze silver gold ## Ejecuta el pipeline completo: Bronze -> Silver -> Gold
+
 .PHONY: quality
 quality: ## Muestra el ultimo informe de calidad de Silver
 	@aws s3 cp "s3://$(BUCKET)/_quality/silver/latest.json" - 2>/dev/null | python3 -m json.tool \

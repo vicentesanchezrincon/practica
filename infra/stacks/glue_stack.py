@@ -7,8 +7,7 @@ Jobs actuales:
                 se puede sembrar con un `psql` desde fuera.
   * `bronze-ingest`  extraccion incremental del RDS a la capa Bronze.
   * `silver-transform`  limpia, deduplica y valida Bronze; MERGE sobre Iceberg.
-
-Gold se anade a este mismo stack en la fase siguiente.
+  * `gold-build`  modelo estrella: dimensiones, hechos y agregados.
 
 Solo los jobs que hablan con el RDS llevan Connection. Los demas corren fuera de
 la VPC: sin ENIs, sin depender de endpoints y arrancando antes.
@@ -69,12 +68,24 @@ class GlueStack(Stack):
 
         self.seed_job = self._create_seed_job(bucket, secret_name, connection_name)
         self.bronze_job = self._create_bronze_job(bucket, secret_name, connection_name)
-        self.silver_job = self._create_silver_job(bucket)
+        self.silver_job = self._create_spark_job(
+            "SilverTransformJob",
+            "silver-transform",
+            "Limpia, deduplica y valida Bronze; MERGE sobre tablas Iceberg",
+            bucket,
+        )
+        self.gold_job = self._create_spark_job(
+            "GoldBuildJob",
+            "gold-build",
+            "Modelo estrella: dimensiones, hechos y agregados de negocio",
+            bucket,
+        )
 
         CfnOutput(self, "GlueRoleArn", value=self.role.role_arn)
         CfnOutput(self, "SeedJobName", value=self.seed_job.ref)
         CfnOutput(self, "BronzeJobName", value=self.bronze_job.ref)
         CfnOutput(self, "SilverJobName", value=self.silver_job.ref)
+        CfnOutput(self, "GoldJobName", value=self.gold_job.ref)
         CfnOutput(
             self,
             "LanzarSiembra",
@@ -159,26 +170,29 @@ class GlueStack(Stack):
             "--extra-py-files": f"s3://{bucket.bucket_name}/{SCRIPTS_PREFIX}/{COMMON_ZIP}",
         }
 
-    def _create_silver_job(self, bucket: s3.IBucket) -> glue.CfnJob:
-        """Limpieza, deduplicacion, cuarentena y MERGE sobre Iceberg.
+    def _create_spark_job(
+        self, construct_id: str, job_suffix: str, description: str, bucket: s3.IBucket
+    ) -> glue.CfnJob:
+        """Job de Spark que solo lee y escribe S3 y el Data Catalog.
 
-        A diferencia de bronze-ingest, este job **no lleva Connection**: no toca
-        el RDS, solo lee S3 y escribe en el Data Catalog. Sin Connection corre
-        en la red gestionada de AWS, asi que no crea ENIs, no depende de VPC
-        endpoints y arranca mas rapido. Meter un job en la VPC cuando no lo
-        necesita solo anade formas de fallar.
+        Sin Connection: no toca el RDS, asi que corre en la red gestionada de
+        AWS. Eso significa que no crea ENIs, no depende de VPC endpoints y
+        arranca antes. Meter un job en la VPC cuando no lo necesita solo anade
+        formas de fallar.
         """
         return glue.CfnJob(
             self,
-            "SilverTransformJob",
-            name=f"practica-{self.environment_name}-silver-transform",
-            description="Limpia, deduplica y valida Bronze; MERGE sobre tablas Iceberg",
+            construct_id,
+            name=f"practica-{self.environment_name}-{job_suffix}",
+            description=description,
             role=self.role.role_arn,
             glue_version=GLUE_VERSION,
             command=glue.CfnJob.JobCommandProperty(
                 name="glueetl",
                 python_version="3",
-                script_location=f"s3://{bucket.bucket_name}/{SCRIPTS_PREFIX}/silver_transform.py",
+                script_location=(
+                    f"s3://{bucket.bucket_name}/{SCRIPTS_PREFIX}/{job_suffix.replace('-', '_')}.py"
+                ),
             ),
             worker_type="G.1X",
             number_of_workers=2,
