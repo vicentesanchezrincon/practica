@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import glob
 import os
+import sys
 
 from pyspark.sql import SparkSession
 
@@ -36,8 +37,19 @@ Sin esto, el primer CREATE TABLE ... USING iceberg falla con ClassNotFoundExcept
 
 
 def running_on_glue() -> bool:
-    """En un job de Glue real esta variable siempre esta puesta."""
-    return os.getenv("GLUE_INSTALLATION_PATH") is not None or os.getenv("--JOB_NAME") is not None
+    """¿Estamos dentro de un job de AWS Glue?
+
+    Se mira `sys.argv`, no el entorno: Glue siempre inyecta `--JOB_NAME` en la
+    linea de comandos del script. La deteccion por variables de entorno no vale
+    (`GLUE_INSTALLATION_PATH` no existe en Glue 5.0), y ejecutar `pytest` en el
+    contenedor local nunca pasa ese argumento.
+
+    Esto no es cosmetico: si falla, los jobs escriben tablas Iceberg con el
+    catalogo Hadoop en lugar del Glue Data Catalog. Los datos quedan bien en S3
+    pero **no se registran en ningun sitio**, asi que Athena no las ve y todo
+    parece funcionar hasta que alguien intenta consultarlas.
+    """
+    return "--JOB_NAME" in sys.argv or os.getenv("GLUE_INSTALLATION_PATH") is not None
 
 
 def local_jars() -> list[str]:
@@ -117,6 +129,13 @@ def build_session(
 
     spark = builder.getOrCreate()
     spark.sparkContext.setLogLevel(os.getenv("SPARK_LOG_LEVEL", "WARN"))
+    # Se deja constancia en los logs: el sintoma de equivocarse de catalogo es
+    # que todo funciona pero las tablas no aparecen en Athena, y sin esta linea
+    # no hay forma de saberlo mirando la ejecucion.
+    print(
+        f"[spark] catalogo={'GlueCatalog' if on_glue else 'hadoop'} warehouse={warehouse}",
+        flush=True,
+    )
     return spark
 
 

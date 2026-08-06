@@ -12,7 +12,31 @@ import pytest
 
 pytest.importorskip("pyspark", reason="Ejecuta los tests dentro del contenedor Glue: make test")
 
-from common.spark_session import CATALOG, iceberg_conf, jdbc_url  # noqa: E402
+from common.spark_session import (  # noqa: E402
+    CATALOG,
+    iceberg_conf,
+    jdbc_url,
+    running_on_glue,
+)
+
+
+def test_se_detecta_glue_por_el_argumento_job_name(monkeypatch):
+    """Glue siempre inyecta --JOB_NAME en la linea de comandos del script.
+
+    Este test nacio de un fallo real: la deteccion miraba variables de entorno
+    (`GLUE_INSTALLATION_PATH`, que no existe en Glue 5.0, y un `os.getenv`
+    sobre `--JOB_NAME`, que ni siquiera es una variable). Nunca detectaba nada,
+    asi que los jobs escribian tablas Iceberg con el catalogo Hadoop en vez del
+    Glue Data Catalog: los datos quedaban bien en S3 pero sin registrar, y
+    Athena no las veia. Todo "funcionaba" hasta que alguien consultaba.
+    """
+    monkeypatch.delenv("GLUE_INSTALLATION_PATH", raising=False)
+
+    monkeypatch.setattr("sys.argv", ["script.py", "--JOB_NAME", "practica-dev-silver-transform"])
+    assert running_on_glue() is True
+
+    monkeypatch.setattr("sys.argv", ["pytest", "tests/unit"])
+    assert running_on_glue() is False
 
 
 def test_la_config_local_de_iceberg_usa_catalogo_hadoop():

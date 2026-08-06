@@ -6,8 +6,12 @@ Jobs actuales:
                 en el RDS. Existe porque el RDS vive en subredes aisladas y no
                 se puede sembrar con un `psql` desde fuera.
   * `bronze-ingest`  extraccion incremental del RDS a la capa Bronze.
+  * `silver-transform`  limpia, deduplica y valida Bronze; MERGE sobre Iceberg.
 
-Silver y Gold se anaden a este mismo stack en las fases siguientes.
+Gold se anade a este mismo stack en la fase siguiente.
+
+Solo los jobs que hablan con el RDS llevan Connection. Los demas corren fuera de
+la VPC: sin ENIs, sin depender de endpoints y arrancando antes.
 
 Todos los jobs reciben `--extra-py-files` con el paquete src/common empaquetado
 en un zip. Glue no ve el codigo del repositorio: solo lo que subimos a S3.
@@ -65,10 +69,12 @@ class GlueStack(Stack):
 
         self.seed_job = self._create_seed_job(bucket, secret_name, connection_name)
         self.bronze_job = self._create_bronze_job(bucket, secret_name, connection_name)
+        self.silver_job = self._create_silver_job(bucket)
 
         CfnOutput(self, "GlueRoleArn", value=self.role.role_arn)
         CfnOutput(self, "SeedJobName", value=self.seed_job.ref)
         CfnOutput(self, "BronzeJobName", value=self.bronze_job.ref)
+        CfnOutput(self, "SilverJobName", value=self.silver_job.ref)
         CfnOutput(
             self,
             "LanzarSiembra",
@@ -152,6 +158,42 @@ class GlueStack(Stack):
             # codigo del repositorio, solo lo que le subimos a S3.
             "--extra-py-files": f"s3://{bucket.bucket_name}/{SCRIPTS_PREFIX}/{COMMON_ZIP}",
         }
+
+    def _create_silver_job(self, bucket: s3.IBucket) -> glue.CfnJob:
+        """Limpieza, deduplicacion, cuarentena y MERGE sobre Iceberg.
+
+        A diferencia de bronze-ingest, este job **no lleva Connection**: no toca
+        el RDS, solo lee S3 y escribe en el Data Catalog. Sin Connection corre
+        en la red gestionada de AWS, asi que no crea ENIs, no depende de VPC
+        endpoints y arranca mas rapido. Meter un job en la VPC cuando no lo
+        necesita solo anade formas de fallar.
+        """
+        return glue.CfnJob(
+            self,
+            "SilverTransformJob",
+            name=f"practica-{self.environment_name}-silver-transform",
+            description="Limpia, deduplica y valida Bronze; MERGE sobre tablas Iceberg",
+            role=self.role.role_arn,
+            glue_version=GLUE_VERSION,
+            command=glue.CfnJob.JobCommandProperty(
+                name="glueetl",
+                python_version="3",
+                script_location=f"s3://{bucket.bucket_name}/{SCRIPTS_PREFIX}/silver_transform.py",
+            ),
+            worker_type="G.1X",
+            number_of_workers=2,
+            timeout=60,
+            max_retries=0,
+            execution_property=glue.CfnJob.ExecutionPropertyProperty(max_concurrent_runs=1),
+            default_arguments={
+                **self._base_arguments(bucket),
+                # Sin esto, los JAR de Iceberg no estan en el classpath y el
+                # primer CREATE TABLE ... USING iceberg falla.
+                "--datalake-formats": "iceberg",
+                "--ENVIRONMENT": self.environment_name,
+                "--BUCKET": bucket.bucket_name,
+            },
+        )
 
     def _create_bronze_job(
         self,
