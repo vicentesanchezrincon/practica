@@ -193,6 +193,19 @@ def test_solo_los_jobs_que_hablan_con_el_rds_llevan_connection(dev):
     assert "practica-dev-seed-rds" in con_connection
     assert "practica-dev-bronze-ingest" in con_connection
     assert "practica-dev-silver-transform" in sin_connection
+    assert "practica-dev-gold-build" in sin_connection
+
+
+def test_los_jobs_de_iceberg_declaran_datalake_formats(dev):
+    """Silver y Gold escriben Iceberg. Sin --datalake-formats, los JAR no estan
+    en el classpath y el primer CREATE TABLE ... USING iceberg falla."""
+    _, glue_stack = dev
+    jobs = {
+        j["Properties"]["Name"]: j["Properties"]["DefaultArguments"]
+        for j in glue_stack.find_resources("AWS::Glue::Job").values()
+    }
+    for nombre in ("practica-dev-silver-transform", "practica-dev-gold-build"):
+        assert jobs[nombre].get("--datalake-formats") == "iceberg", nombre
 
 
 def test_el_job_de_silver_carga_las_librerias_de_iceberg(dev):

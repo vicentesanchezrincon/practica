@@ -105,7 +105,7 @@ make destroy-dev                      # destruye (hazlo al acabar)
 | `Practica-Dev-Network` | VPC 10.20.0.0/16, 2 AZ, solo subredes aisladas (sin NAT ni IGW), security groups de Glue y RDS, VPC endpoints |
 | `Practica-Dev-Storage` | Bucket `practica-datalake-dev-<cuenta>-<región>` y las tres bases del Glue Data Catalog |
 | `Practica-Dev-Database` | RDS Postgres 16.9 `db.t4g.micro` en subredes aisladas, credenciales en Secrets Manager, y la Glue Connection JDBC |
-| `Practica-Dev-Glue` | Rol de ejecución de Glue, publicación de scripts a S3, y los jobs `seed-rds`, `bronze-ingest` y `silver-transform` |
+| `Practica-Dev-Glue` | Rol de ejecución de Glue, publicación de scripts a S3, y los jobs `seed-rds`, `bronze-ingest`, `silver-transform` y `gold-build` |
 
 Dos detalles que merecen atención:
 
@@ -339,6 +339,109 @@ SELECT * FROM practica_dev_silver.customers LIMIT 10;
 
 ---
 
+## Capa Gold: modelo estrella
+
+```bash
+make gold        # construye el modelo estrella
+make pipeline    # bronze -> silver -> gold de una tacada
+```
+
+| Tabla | Qué es |
+|---|---|
+| `dim_date` | Calendario generado, clave `AAAAMMDD` |
+| `dim_product` | **SCD tipo 1**: refleja el estado actual, sin historia |
+| `dim_customer` | **SCD tipo 2**: una versión por cada cambio |
+| `fct_order_items` | Los hechos, a grano de **línea de pedido** |
+| `agg_daily_sales` | Ingresos, unidades y ticket medio por día y categoría |
+
+Los conceptos están explicados en [docs/GLOSARIO.md](GLOSARIO.md).
+
+### El grano
+
+`fct_order_items` tiene grano de **línea**, no de pedido. Es el más atómico
+disponible, y desde ahí se puede agregar a cualquier nivel — al revés no.
+
+Consecuencia que hay que tener presente: **no lleva `total_amount`** del pedido.
+Repetirlo en cada línea lo duplicaría al sumar. El total de un pedido se obtiene
+sumando sus líneas.
+
+Por lo mismo, el ticket medio de `agg_daily_sales` divide entre **pedidos
+distintos**, no entre líneas. Dividir entre líneas daría el importe medio por
+línea, que es otra cosa y siempre sale más bajo.
+
+### SCD tipo 2 en `dim_customer`
+
+Cuando un cliente cambia de segmento no se sobrescribe: se cierra la versión
+anterior y se abre una nueva.
+
+```
+customer_id  segment   valid_from                 valid_to                   is_current
+          7  silver    1970-01-01 00:00:00        2026-08-06 15:53:55        false
+          7  platinum  2026-08-06 15:53:55        9999-12-31 00:00:00        true
+```
+
+Así una consulta sobre marzo usa el segmento que el cliente tenía **en marzo**.
+El `as-of join` de `src/common/dimensions.py` lo resuelve:
+
+```sql
+ON  f.customer_id = d.customer_id
+AND f.order_date >= d.valid_from
+AND f.order_date <  d.valid_to
+```
+
+Detalles que no son obvios:
+
+- **La historia no se puede reconstruir.** Silver solo guarda el estado actual
+  (el `MERGE` sobrescribe), así que el SCD2 se construye ejecución a ejecución.
+  La historia empieza el día que empiezas a ejecutar Gold.
+- **No todos los cambios abren versión.** Solo `segment`, `country_code` y
+  `marketing_opt_in`. Corregir una errata en el nombre no cambia ningún análisis.
+- **`valid_to` usa `9999-12-31`, no `NULL`**, para que el join se escriba sin un
+  `OR valid_to IS NULL`.
+- Los atributos se comparan con `<=>` (null-safe) y no con `!=`. En SQL
+  `NULL != 'gold'` es NULL, así que un cambio desde NULL pasaría desapercibido.
+
+### Claves subrogadas deterministas
+
+Se calculan con `xxhash64` de la clave de negocio (más `valid_from` en las
+dimensiones históricas), no con un contador. Con `monotonically_increasing_id`,
+cada reconstrucción de Gold reasignaría claves y los hechos ya escritos
+apuntarían a la fila equivocada.
+
+### El miembro desconocido
+
+La fila `-1` de cada dimensión, adonde van los hechos huérfanos. **No es un
+adorno**: resuelve la herencia de la Fase 5, donde Silver deliberadamente no es
+referencialmente cerrada.
+
+Medido en AWS con datos reales:
+
+```sql
+SELECT d.segment, count(*) lineas, round(sum(f.line_amount),2) ingresos
+FROM practica_dev_gold.fct_order_items f
+JOIN practica_dev_gold.dim_customer d ON f.customer_key = d.customer_key
+GROUP BY d.segment ORDER BY 3 DESC;
+```
+
+| segment | líneas | ingresos |
+|---|---|---|
+| platinum | 68.832 | 93.451.359,99 |
+| gold | 56.105 | 75.856.346,35 |
+| bronze | 55.620 | 75.138.173,21 |
+| silver | 55.506 | 75.059.365,51 |
+| **(desconocido)** | **17.156** | **23.407.988,81** |
+
+Esos 23,4 millones son un **7% de los ingresos** que con un `INNER JOIN` se
+habrían perdido en silencio. Con el miembro desconocido siguen contando y además
+el problema queda visible y perseguible.
+
+### El cuadre
+
+El job **falla si los ingresos de Gold no coinciden con los de Silver**. Si un
+join pierde o duplica líneas, se sabe ahí y no cuando el negocio se queje.
+
+---
+
 ## Problemas conocidos
 
 ### `permission denied` en `/var/run/docker.sock`
@@ -483,7 +586,7 @@ gh pr create --base develop
 - [x] **Fase 3** — `feature/rds-and-connection`: RDS + Glue Connection + siembra
 - [x] **Fase 4** — `feature/bronze-ingest`: extracción incremental por watermark
 - [x] **Fase 5** — `feature/silver-iceberg`: limpieza, dedup, MERGE, cuarentena
-- [ ] **Fase 6** — `feature/gold-marts`: modelo estrella y SCD2
+- [x] **Fase 6** — `feature/gold-marts`: modelo estrella y SCD2
 - [ ] **Fase 7** — `feature/step-functions`: orquestación y gate de calidad
 - [ ] **Fase 8** — `feature/ci-cd`: GitHub Actions con OIDC
 - [ ] **Fase 9** — `release/1.0.0` y ejercicio de hotfix
