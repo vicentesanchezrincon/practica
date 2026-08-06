@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from stacks.database_stack import DatabaseStack  # noqa: E402
 from stacks.glue_stack import GlueStack  # noqa: E402
 from stacks.network_stack import NetworkStack  # noqa: E402
+from stacks.orchestration_stack import OrchestrationStack  # noqa: E402
 from stacks.storage_stack import StorageStack  # noqa: E402
 
 VALID_ENVIRONMENTS = ("dev", "prod")
@@ -85,6 +86,21 @@ glue_stack = GlueStack(
     glue_security_group=network.glue_sg,
     description="Rol de ejecucion y jobs de Glue",
 )
+
+orchestration = OrchestrationStack(
+    app,
+    f"{prefix}-Orchestration",
+    environment=environment,
+    env=env,
+    bucket=storage.bucket,
+    bronze_job=glue_stack.bronze_job,
+    silver_job=glue_stack.silver_job,
+    gold_job=glue_stack.gold_job,
+    # Opcional: cdk deploy ... -c alert_email=tu@correo.com
+    alert_email=app.node.try_get_context("alert_email"),
+    description="Maquina de estados del pipeline, alertas y ejecucion programada",
+)
+orchestration.add_stack_dependency(glue_stack)
 
 # CloudFormation deduce casi todas las dependencias de las referencias cruzadas,
 # pero el job declara la Connection por nombre (un string), no por referencia.

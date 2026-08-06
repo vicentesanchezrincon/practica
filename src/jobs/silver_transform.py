@@ -291,26 +291,29 @@ def main() -> None:
         log(f"  {marca} {r.table:<12} {r.rate:>7.2%}  umbral {umbral:.0%}")
     log(f"  total: {resumen['quarantined']}/{resumen['total']} ({resumen['rate']:.2%})")
 
-    if not resumen["passed"]:
-        # Silver YA tiene las filas validas de este lote: el MERGE ocurre antes
-        # de esta comprobacion y solo escribe filas que pasaron la validacion,
-        # asi que la tabla no queda corrupta. Lo que impide este fallo es que se
-        # construya Gold sobre un lote del que se ha rechazado demasiado: no es
-        # "hay datos malos publicados", es "se ha perdido tanto que los
-        # agregados no serian representativos".
+    # El job REPORTA la calidad, no decide que hacer con ella.
+    #
+    # La decision es del orquestador: la maquina de estados lee este informe y
+    # corta el pipeline antes de Gold si no pasa. Tener la puerta aqui ademas
+    # significaria dos implementaciones del mismo criterio, que tarde o temprano
+    # divergen. El umbral vive en un solo sitio, config.py; quien lo aplica es
+    # quien orquesta.
+    #
+    # Silver, en cualquier caso, no queda corrupta: el MERGE solo escribe filas
+    # que pasaron la validacion. Lo que el corte evita es construir Gold sobre
+    # un lote del que se ha rechazado tanto que los agregados no serian
+    # representativos.
+    if resumen["passed"]:
+        log("calidad OK")
+    else:
         malas = [
             f"{r.table} {r.rate:.2%} (umbral {get_table(r.table).quarantine_threshold:.2%})"
             for r in reports
             if r.rate > get_table(r.table).quarantine_threshold
         ]
-        spark.stop()
-        raise RuntimeError(
-            f"Demasiadas filas rechazadas en: {'; '.join(malas)}. "
-            f"Silver contiene solo las validas; Gold no debe construirse sobre "
-            f"este lote. Revisa s3://{bucket}/silver/_quarantine/"
-        )
+        log(f"CALIDAD INSUFICIENTE en: {'; '.join(malas)}")
+        log(f"  revisa s3://{bucket}/silver/_quarantine/")
 
-    log("calidad OK")
     spark.stop()
 
 
