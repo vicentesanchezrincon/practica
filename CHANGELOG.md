@@ -10,6 +10,31 @@ mal desde la 1.0.0 y hay que reconstruir Gold» es una entrada de changelog.
 
 ## [No publicado]
 
+## [1.0.1] — 2026-08-06
+
+### Corregido
+
+- **`agg_daily_sales`: el ticket medio estaba mal desde la 1.0.0.** Se calculaba
+  dividiendo los ingresos entre el número de **líneas** de pedido en lugar de
+  entre los pedidos distintos, con lo que salía sistemáticamente más bajo, en la
+  proporción pedidos/líneas. Medido en un día real: 1.384,16 en vez de 1.568,97
+  para la categoría «hogar», un 12% de desviación.
+
+  **Afecta a todos los datos generados con la 1.0.0.** Hay que reconstruir Gold:
+
+  ```bash
+  make gold
+  ```
+
+  El resto de tablas no está afectado: `revenue`, `units`, `orders` y `lines`
+  siempre fueron correctos, y el cuadre de ingresos con Silver nunca falló — por
+  eso el bug pasó desapercibido.
+
+### Añadido
+
+- `tests/unit/test_gold_agg.py`: siete tests sobre el agregado, que era la única
+  parte de Gold sin cobertura. Esa ausencia es lo que permitió el incidente.
+
 ## [1.0.0] — 2026-08-06
 
 Primera versión completa: el pipeline va de Postgres a un modelo estrella
@@ -50,5 +75,6 @@ consultable en Athena, orquestado y con CI.
 - El despliegue desde `develop` **no** es automático. Al mergear solo se
   ejecuta `cdk diff`; el despliegue real se pide a mano.
 
-[No publicado]: https://github.com/vicentesanchezrincon/practica/compare/v1.0.0...develop
+[No publicado]: https://github.com/vicentesanchezrincon/practica/compare/v1.0.1...develop
+[1.0.1]: https://github.com/vicentesanchezrincon/practica/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/vicentesanchezrincon/practica/releases/tag/v1.0.0
