@@ -106,6 +106,7 @@ make destroy-dev                      # destruye (hazlo al acabar)
 | `Practica-Dev-Storage` | Bucket `practica-datalake-dev-<cuenta>-<región>` y las tres bases del Glue Data Catalog |
 | `Practica-Dev-Database` | RDS Postgres 16.9 `db.t4g.micro` en subredes aisladas, credenciales en Secrets Manager, y la Glue Connection JDBC |
 | `Practica-Dev-Glue` | Rol de ejecución de Glue, publicación de scripts a S3, y los jobs `seed-rds`, `bronze-ingest`, `silver-transform` y `gold-build` |
+| `Practica-Dev-Orchestration` | Máquina de estados de Step Functions, topic SNS y regla de EventBridge |
 
 Dos detalles que merecen atención:
 
@@ -442,6 +443,82 @@ join pierde o duplica líneas, se sabe ahí y no cuando el negocio se queje.
 
 ---
 
+## Orquestación
+
+```bash
+make run       # ejecuta el pipeline completo y espera
+make history   # últimas ejecuciones
+```
+
+```
+Bronze ──► Silver ──► LeerInformeDeCalidad ──► ¿pasa? ──no──► SNS ──► Fail
+                                                  │ sí
+                                                  ▼
+                                                Gold ──► Success
+```
+
+Con alertas por correo:
+
+```bash
+cdk deploy --all -c environment=dev -c alert_email=tu@correo.com
+```
+
+AWS envía un correo de confirmación; hasta que no lo aceptes no llega ninguna
+alerta.
+
+### Dos decisiones que se apartan del plan
+
+**No hay estado `Map` sobre las tablas.** El plan proponía un `Map` con
+concurrencia 3 lanzando un job por tabla. No compensa: `bronze-ingest` ya
+recorre las cuatro tablas en una sola ejecución y Spark paraleliza por dentro.
+Un `Map` serían **cuatro arranques de Glue** (~1 minuto cada uno solo de
+arrancar) en lugar de uno, más caro y más lento, a cambio de nada. `Map` tiene
+sentido cuando cada elemento necesita su propio cluster o cuando quieres que el
+fallo de uno no bloquee a los demás.
+
+**La puerta de calidad la aplica la máquina, no el job.** El job de Silver
+escribe su informe en S3 y no decide. Así el criterio vive en un solo sitio
+(`config.py`) y solo hay un sitio que lo aplica. Además permite distinguir dos
+cosas que no son iguales:
+
+| | Significa | Cómo se maneja |
+|---|---|---|
+| `CalidadInsuficiente` | El pipeline funciona; los datos venían mal | `Choice` → SNS → `Fail` |
+| `PipelineFallido` | Algo se rompió | `Catch` → SNS → `Fail` |
+
+Mezclarlas hace imposible saber qué está pasando mirando las alertas.
+
+### Sin Lambda
+
+El informe se lee con la integración SDK de Step Functions
+(`aws-sdk:s3:getObject`) y se parsea con `States.StringToJson`. Una Lambda solo
+para leer un JSON sería una pieza más que mantener, desplegar y vigilar.
+
+### Detalles que solo fallan en ejecución
+
+- **`.sync` en las tareas de Glue.** Es lo que hace que la máquina *espere*. Con
+  `REQUEST_RESPONSE` seguiría al estado siguiente nada más lanzar el job, y
+  Silver empezaría con Bronze a medias.
+- **SNS exige que `Message` sea un string.** Pasar `$.error` a secas manda un
+  objeto y la publicación falla — en ejecución, no en el `synth`. Se envuelve en
+  `States.JsonToString(...)`.
+- **La regla de EventBridge está deshabilitada en dev.** Que se despierte de
+  madrugada contra una infraestructura ya destruida solo genera alertas inútiles.
+
+### Verificado en AWS
+
+| Prueba | Resultado |
+|---|---|
+| Pipeline completo | `SUCCEEDED` en **7 min 4 s** |
+| Recorrido | Bronze → Silver → LeerInforme → Choice → Gold → Success |
+| Con un lote corrupto (`--dirt-factor 20`) | `FAILED` con error `CalidadInsuficiente` |
+| Recorrido en ese caso | Bronze → Silver → LeerInforme → Choice → **AvisarCalidad** → Fail |
+| ¿Se construyó Gold? | **No.** Gold no aparece en el histórico de ejecución. |
+
+La causa del corte fue `orders` al 7,69% frente a su umbral del 5%.
+
+---
+
 ## Problemas conocidos
 
 ### `permission denied` en `/var/run/docker.sock`
@@ -587,7 +664,7 @@ gh pr create --base develop
 - [x] **Fase 4** — `feature/bronze-ingest`: extracción incremental por watermark
 - [x] **Fase 5** — `feature/silver-iceberg`: limpieza, dedup, MERGE, cuarentena
 - [x] **Fase 6** — `feature/gold-marts`: modelo estrella y SCD2
-- [ ] **Fase 7** — `feature/step-functions`: orquestación y gate de calidad
+- [x] **Fase 7** — `feature/step-functions`: orquestación y gate de calidad
 - [ ] **Fase 8** — `feature/ci-cd`: GitHub Actions con OIDC
 - [ ] **Fase 9** — `release/1.0.0` y ejercicio de hotfix
 

@@ -194,9 +194,14 @@ seed-rds: ## Lanza el job de Glue que siembra el RDS y espera a que acabe
 bronze: ## Ingesta incremental del RDS a la capa Bronze (TABLES=orders,... opcional)
 	$(call run_glue_job,bronze-ingest,$(if $(TABLES),--arguments '{"--TABLES":"$(TABLES)"}'))
 
+# El job de Silver solo informa de la calidad; la puerta la aplica quien
+# orquesta. En AWS eso es la maquina de estados; aqui, este target.
 .PHONY: silver
 silver: ## Limpia Bronze y hace MERGE sobre Silver (FULL=1 para todo el historico)
 	$(call run_glue_job,silver-transform,$(if $(FULL),--arguments '{"--FULL_REFRESH":"true"}',$(if $(TABLES),--arguments '{"--TABLES":"$(TABLES)"}')))
+	@aws s3 cp "s3://$(BUCKET)/_quality/silver/latest.json" - 2>/dev/null \
+	  | python3 -c 'import json,sys; r=json.load(sys.stdin); \
+	    sys.exit(0) if r["passed"] else (print("Calidad insuficiente; Gold no debe construirse.") or sys.exit(1))'
 
 .PHONY: gold
 gold: ## Construye el modelo estrella en Gold
@@ -204,6 +209,31 @@ gold: ## Construye el modelo estrella en Gold
 
 .PHONY: pipeline
 pipeline: bronze silver gold ## Ejecuta el pipeline completo: Bronze -> Silver -> Gold
+
+.PHONY: run
+run: ## Ejecuta la maquina de estados completa y espera a que termine
+	@ARN=$$(aws cloudformation describe-stacks --stack-name $(STACK_PREFIX)-Orchestration \
+	  --query "Stacks[0].Outputs[?OutputKey=='StateMachineArn'].OutputValue" --output text); \
+	test -n "$$ARN" || { echo "No encuentro la maquina de estados. ¿Has desplegado?"; exit 1; }; \
+	EXEC=$$(aws stepfunctions start-execution --state-machine-arn $$ARN --query executionArn --output text); \
+	echo "Ejecucion lanzada: $$EXEC"; \
+	while true; do \
+	  ESTADO=$$(aws stepfunctions describe-execution --execution-arn $$EXEC --query status --output text); \
+	  case $$ESTADO in \
+	    SUCCEEDED) echo "OK: $$ESTADO"; break;; \
+	    FAILED|TIMED_OUT|ABORTED) echo "FALLO: $$ESTADO"; \
+	      aws stepfunctions describe-execution --execution-arn $$EXEC --query '[error,cause]' --output text; \
+	      exit 1;; \
+	    *) printf "  %s\r" $$ESTADO; sleep 20;; \
+	  esac; \
+	done
+
+.PHONY: history
+history: ## Ultimas ejecuciones de la maquina de estados
+	@ARN=$$(aws cloudformation describe-stacks --stack-name $(STACK_PREFIX)-Orchestration \
+	  --query "Stacks[0].Outputs[?OutputKey=='StateMachineArn'].OutputValue" --output text); \
+	aws stepfunctions list-executions --state-machine-arn $$ARN --max-items 5 \
+	  --query 'executions[].[status,startDate,name]' --output table
 
 .PHONY: quality
 quality: ## Muestra el ultimo informe de calidad de Silver
