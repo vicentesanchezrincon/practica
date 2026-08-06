@@ -115,7 +115,7 @@ practica/
 ├── src/
 │   ├── common/              codigo compartido, se empaqueta para Glue
 │   └── jobs/                seed_rds, bronze_ingest, silver_transform, gold_build
-├── tests/unit/              97 tests con PySpark local
+├── tests/unit/              104 tests con PySpark local
 ├── CHANGELOG.md
 ├── Makefile
 └── pyproject.toml
@@ -745,7 +745,7 @@ Tres workflows en `.github/workflows/`:
 
 | Workflow | Cuándo | Qué hace |
 |---|---|---|
-| `ci.yml` | cada PR y push a ramas protegidas | lint, 97 tests unitarios, 65 de infraestructura, `cdk synth` |
+| `ci.yml` | cada PR y push a ramas protegidas | lint, 104 tests unitarios, 65 de infraestructura, `cdk synth` |
 | `deploy-dev.yml` | push a `develop` / manual | `cdk diff` siempre; despliega solo si se pide |
 | `deploy-prod.yml` | push a `main` / manual | igual, más aprobación manual |
 
@@ -772,7 +772,7 @@ Y se comprobó provocándolo, que es lo único que demuestra que funciona:
 ```bash
 python3 -m pytest tests/unit -m "not integration"      # exit 0, saltando tests
 PRACTICA_EXIGE_PYSPARK=1 python3 -m pytest tests/unit  # exit 4, con el motivo
-make test-ci                                           # 97 passed
+make test-ci                                           # 104 passed
 ```
 
 Los tests corren dentro de `public.ecr.aws/glue/aws-glue-libs:5`. Las
@@ -851,6 +851,34 @@ precisamente porque no sabe en qué cuenta está.
     defecto**: en un repositorio que nunca ha usado Actions, el PR que introduce
     el CI no dispara su propio CI.
 
+## 12.6 Lo que quedó sin verificar, y cómo se distingue
+
+El día que se montó esta fase, **GitHub Actions estaba en caída mayor**. Los
+workflows se registraron correctamente, pero ningún runner llegó a asignarse: el
+job estuvo quince minutos encolado y GitHub lo canceló con **cero pasos
+ejecutados**.
+
+Merece la pena contar cómo se llegó a esa conclusión, porque el síntoma —«el CI
+no arranca»— apunta por defecto a que uno ha escrito mal el YAML. Se descartó en
+este orden: el YAML parsea; el token tiene scope `workflow`; el repositorio es
+público y no es un fork; Actions está habilitado; los tres workflows aparecen
+como `active`; y un `workflow_dispatch` **sí** crea el run, que se queda
+encolado. Lo último es lo que descarta la configuración y señala a la
+infraestructura, y se confirmó en `githubstatus.com`.
+
+Así que del CI está verificado todo menos su ejecución:
+
+| Verificado | Cómo |
+|---|---|
+| El rol OIDC y su trust policy | `aws iam get-role`, sobre el rol ya desplegado |
+| El mecanismo anti-skip | provocándolo: exit 0 saltando tests vs exit 4 |
+| `cdk synth` sin credenciales | exit 0 |
+| `Practica-Cicd` fuera del `--all` | `cdk list` con y sin `-c cicd=true` |
+| **Un run del workflow** | **pendiente** |
+
+Decirlo así, y no «el CI funciona», es la diferencia entre documentación y
+propaganda.
+
 ---
 
 # 13. Calidad: tests, linting y pre-commit
@@ -859,7 +887,7 @@ Dos suites, con dos entornos distintos:
 
 | Suite | Dónde corre | Cuántos |
 |---|---|---|
-| `tests/unit` | contenedor de Glue | **97** |
+| `tests/unit` | contenedor de Glue | **104** |
 | `infra/tests` | venv del host | **65** |
 
 Los tests de infraestructura no tocan AWS: construyen la plantilla en memoria
@@ -988,14 +1016,31 @@ Es creíble por cuatro razones, y las cuatro son la lección:
 4. Se borró el comentario que avisaba justo de este error: el patrón clásico de
    «el comentario estorbaba».
 
-El bug **no da ningún error**. El job termina `SUCCEEDED`, la puerta de calidad
-pasa (mide Silver, no Gold), las tablas se escriben y el número está mal. Se
-detecta cuadrando en Athena: si `avg_ticket` es el ticket medio por pedido,
-`avg_ticket * orders` debe aproximar `revenue`; con el bug aproxima siempre
-menos.
+El bug **no da ningún error**. El job termina `SUCCEEDED`, el cuadre de ingresos
+con Silver pasa —porque comprueba `revenue`, no `avg_ticket`— y la puerta de
+calidad pasa, porque mide Silver y no Gold. Las tablas se escriben y el número
+está mal.
+
+Se detecta cuadrando en Athena: si `avg_ticket` es el ticket medio por pedido,
+`avg_ticket * orders` tiene que aproximar `revenue`. Medido en AWS con el bug
+desplegado:
+
+| category | revenue | orders | lines | avg_ticket | reconstruido |
+|---|---|---|---|---|---|
+| hogar | 1.128.091,55 | 719 | 815 | 1.384,16 | **995.211,04** |
+| deporte | 1.380.179,85 | 831 | 967 | 1.427,28 | **1.186.069,68** |
+
+Un 12% de desviación, exactamente la proporción `orders/lines`. Y tras el
+arreglo, el mismo día y la misma categoría: `avg_ticket` 1.568,97 y
+`reconstruido` 1.128.089,43, que cuadra con el ingreso real salvo el redondeo a
+dos decimales.
 
 `hotfix/1.0.1` sale de `main`, arregla el cálculo, **añade el test de regresión**
 y vuelve a `main` **y a `develop`**.
+
+Que el test caza el bug se comprobó reintroduciendo la división mala: tres tests
+fallan con `assert 100.0 == 200.0`. Un test que no se ha visto fallar no es un
+test.
 
 Esa doble fusión no es burocracia, y aquí se ve por qué mejor que en ningún otro
 ejemplo: **el bug entró por la rama de release, que se fusionó a las dos ramas**,
