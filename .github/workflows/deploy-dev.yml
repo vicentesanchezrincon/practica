@@ -1,0 +1,86 @@
+# Despliegue del entorno de desarrollo.
+#
+# A diferencia de ci.yml, este workflow SI entra en AWS. Lo hace con OIDC: no
+# hay ninguna clave de acceso guardada en los secrets del repositorio. GitHub
+# firma un token de vida cortisima que dice quien esta ejecutando que, AWS lo
+# valida y devuelve credenciales temporales. No hay nada que rotar porque no hay
+# nada guardado.
+name: Deploy dev
+
+on:
+  # Siempre presente: el modo manual no se quita nunca.
+  workflow_dispatch:
+  # Siempre declarado, pero desarmado por el `if` del job. Ver mas abajo.
+  push:
+    branches: [develop]
+
+permissions:
+  # Imprescindible: sin este permiso GitHub no emite el token OIDC y
+  # configure-aws-credentials falla con un 403 que no explica nada.
+  id-token: write
+  contents: read
+
+concurrency:
+  group: deploy-dev
+  # Al reves que en el CI: aqui NO se cancela. Dos despliegues a la vez sobre
+  # el mismo stack dan UPDATE_IN_PROGRESS y un rollback de veinte minutos.
+  # Mejor que se encolen.
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Va como secret y no como variable porque el ARN lleva dentro el id
+          # de cuenta y este repositorio es PUBLICO. Es la misma razon por la
+          # que infra/cdk.context.json esta en .gitignore. Como secret, ademas,
+          # GitHub lo enmascara en los logs.
+          role-to-assume: ${{ secrets.AWS_ROLE_DEV_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          # El id de ejecucion en el nombre de sesion: en CloudTrail se ve
+          # exactamente que run hizo cada llamada.
+          role-session-name: gha-deploy-dev-${{ github.run_id }}
+
+      # El Makefile invoca `cdk`, no `npx cdk`.
+      - run: npm install -g aws-cdk@2
+      - run: pip install -r infra/requirements.txt
+
+      # Antes de cualquier cdk: build/ esta en .gitignore y GlueStack publica
+      # ese directorio como asset.
+      - run: make build-common
+
+      # Al mergear en develop esto es lo unico que pasa: leer AWS y contar que
+      # cambiaria. No crea nada, no cuesta nada, y deja en el log del run la
+      # respuesta a "¿que hay ahora mismo desplegado que no sea esta rama?".
+      - name: Que cambiaria en AWS
+        run: make diff ENV=dev
+
+      # ------------------------------------------------------------------
+      # EL INTERRUPTOR DE COSTE.
+      #
+      # Con la variable sin definir -que es el estado por defecto- un push a
+      # develop llega hasta aqui, se salta el despliegue y termina en verde sin
+      # gastar un centimo. Para pasar a despliegue continuo de verdad:
+      #
+      #     gh variable set DESPLIEGUE_AUTOMATICO_DEV --body true
+      #
+      # Se usa una variable de repositorio en vez de comentar el `on: push`
+      # porque asi el cambio no toca el codigo: se activa o se revierte en
+      # segundos, sin PR, sin merge y sin proteccion de rama de por medio. Esta
+      # infraestructura cuesta ~0,05 USD/hora y se destruye al acabar cada
+      # sesion; un merge no deberia poder resucitarla sin que tu lo pidas.
+      # ------------------------------------------------------------------
+      - name: Desplegar
+        if: github.event_name == 'workflow_dispatch' || vars.DESPLIEGUE_AUTOMATICO_DEV == 'true'
+        run: make deploy-dev

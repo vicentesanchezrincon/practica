@@ -23,6 +23,7 @@ import aws_cdk as cdk
 # duplicar esas reglas aqui, importamos las mismas funciones que usan los jobs.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
+from stacks.cicd_stack import CicdStack  # noqa: E402
 from stacks.database_stack import DatabaseStack  # noqa: E402
 from stacks.glue_stack import GlueStack  # noqa: E402
 from stacks.network_stack import NetworkStack  # noqa: E402
@@ -106,6 +107,29 @@ orchestration.add_stack_dependency(glue_stack)
 # pero el job declara la Connection por nombre (un string), no por referencia.
 # Sin esta linea, Glue podria desplegarse antes de que la Connection exista.
 glue_stack.add_stack_dependency(database)
+
+# El stack de CI/CD solo se construye si lo pides explicitamente.
+#
+# No es cosmetica: `cdk deploy --all` y `cdk destroy --all` actuan sobre los
+# stacks que este fichero CONSTRUYE. Si no se construye, no existe para ellos, y
+# el `make destroy-dev` del final de cada sesion no puede llevarselo por delante.
+# Confiar en un `--exclusively` o en llamarlo "no-tocar" dependeria de que te
+# acuerdes justo el dia que tengas prisa.
+#
+# El `str(...).lower() == "true"` tampoco es manias: `-c cicd=false` llega como
+# la CADENA "false", que en Python es verdadera. Ese fallo lo comete todo el
+# mundo una vez.
+if str(app.node.try_get_context("cicd")).lower() == "true":
+    CicdStack(
+        app,
+        "Practica-Cicd",
+        env=env,
+        repo=app.node.try_get_context("github_repo") or "vicentesanchezrincon/practica",
+        # Segundo cinturon: si algun dia el stack acabara dentro de un --all por
+        # error, CloudFormation se niega a borrarlo.
+        termination_protection=True,
+        description="Proveedor OIDC de GitHub y roles que asume GitHub Actions",
+    )
 
 # Etiquetas en todo lo que se cree: sin esto es imposible saber despues que
 # recurso de la factura pertenece a que proyecto.
