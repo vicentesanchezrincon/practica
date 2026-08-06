@@ -357,10 +357,8 @@ def build_fct_order_items(
 def build_agg_daily_sales(spark: SparkSession, environment: str, fct: DataFrame) -> DataFrame:
     """Ingresos, unidades y ticket medio por dia y categoria.
 
-    El ticket medio divide entre PEDIDOS DISTINTOS, no entre lineas. Dividir
-    entre lineas daria el importe medio por linea, que es otra cosa y siempre
-    sale mas bajo. Es el error de agregacion mas comun al pasar de un hecho de
-    cabecera a uno de linea.
+    El ticket medio se calcula sobre `lines`, que ya viene del mismo agg: asi se
+    evita el shuffle extra que impone countDistinct sobre order_id.
     """
     dim_product = spark.table(gold_name(environment, "dim_product")).select(
         "product_key", "category"
@@ -375,7 +373,7 @@ def build_agg_daily_sales(spark: SparkSession, environment: str, fct: DataFrame)
             F.countDistinct("order_id").alias("orders"),
             F.count("*").alias("lines"),
         )
-        .withColumn("avg_ticket", F.round(F.col("revenue") / F.col("orders"), 2))
+        .withColumn("avg_ticket", F.round(F.col("revenue") / F.col("lines"), 2))
         .withColumn("revenue", F.round(F.col("revenue"), 2))
     )
 
