@@ -761,7 +761,9 @@ gh pr create --base develop
 - [x] **Fase 6** — `feature/gold-marts`: modelo estrella y SCD2
 - [x] **Fase 7** — `feature/step-functions`: orquestación y gate de calidad
 - [x] **Fase 8** — `feature/ci-cd`: GitHub Actions con OIDC
-- [ ] **Fase 9** — `release/1.0.0` y ejercicio de hotfix
+- [x] **Fase 9** — `release/1.0.0` y ejercicio de hotfix
+
+El histórico de versiones está en [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
