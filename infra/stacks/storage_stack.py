@@ -55,6 +55,20 @@ class StorageStack(Stack):
                     expiration=Duration.days(30),
                 ),
                 s3.LifecycleRule(
+                    id="archivar-la-zona-de-aterrizaje",
+                    prefix="landing/",
+                    # Los ficheros del proveedor NO se borran: se pasan a una
+                    # clase mas barata. Bronze guarda su contenido interpretado,
+                    # pero ante una reclamacion hay que poder ensenar el fichero
+                    # original byte a byte, y eso Bronze ya no lo es.
+                    transitions=[
+                        s3.Transition(
+                            storage_class=s3.StorageClass.INFREQUENT_ACCESS,
+                            transition_after=Duration.days(30),
+                        )
+                    ],
+                ),
+                s3.LifecycleRule(
                     id="limpiar-versiones-antiguas",
                     noncurrent_version_expiration=Duration.days(30),
                     # Iceberg reescribe metadatos constantemente. Sin esto, cada

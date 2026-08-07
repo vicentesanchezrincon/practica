@@ -230,3 +230,22 @@ def test_dev_y_prod_no_colisionan(storage_dev, storage_prod):
         return next(iter(t.find_resources("AWS::S3::Bucket").values()))["Properties"]["BucketName"]
 
     assert nombre(storage_dev) != nombre(storage_prod)
+
+
+def test_la_zona_de_aterrizaje_se_archiva_pero_no_se_borra(storage_dev):
+    """Los ficheros del proveedor no se tiran.
+
+    Bronze guarda su contenido ya interpretado, pero ante una reclamacion hay
+    que poder ensenar el fichero ORIGINAL byte a byte, y eso Bronze ya no lo
+    es. Se abaratan a los 30 dias; expirarlos seria perder la prueba.
+    """
+    reglas = {
+        r["Id"]: r
+        for r in storage_dev.find_resources("AWS::S3::Bucket").popitem()[1]["Properties"][
+            "LifecycleConfiguration"
+        ]["Rules"]
+    }
+    landing = reglas["archivar-la-zona-de-aterrizaje"]
+    assert landing["Prefix"] == "landing/"
+    assert "ExpirationInDays" not in landing
+    assert landing["Transitions"][0]["StorageClass"] == "STANDARD_IA"

@@ -15,6 +15,8 @@ from common.config import (
     LINEAGE_PREFIX,
     QUARANTINE_THRESHOLD,
     TABLES,
+    FileSource,
+    JdbcSource,
     Layout,
     SourceSpec,
     catalog_database,
@@ -63,11 +65,32 @@ def test_toda_tabla_declara_como_desempatar_el_dedup():
         assert spec.dedup_order, f"{spec.name} no declara dedup_order"
 
 
-def test_las_columnas_de_desempate_no_son_de_linaje():
-    """Ordenar por `_ingested_at` como criterio principal haria que el
-    superviviente dependiera de cuando se ejecuto el job, no de los datos."""
+def test_un_origen_jdbc_nunca_desempata_por_el_linaje():
+    """Ordenar por `_ingested_at` haria que el superviviente dependiera de
+    cuando se ejecuto el job y no de los datos.
+
+    La regla vale **donde el origen ofrece un orden**, que es el caso de JDBC:
+    ahi siempre hay una columna que dice que version es posterior. Un origen de
+    ficheros no la tiene, y ahi el linaje es la respuesta correcta y no un
+    atajo. Ver el test siguiente.
+    """
     for spec in TABLES.values():
-        assert not any(c.startswith(LINEAGE_PREFIX) for c in spec.dedup_order)
+        if isinstance(spec.source, JdbcSource):
+            assert not any(c.startswith(LINEAGE_PREFIX) for c in spec.dedup_order), spec.name
+
+
+def test_un_origen_de_ficheros_si_puede_desempatar_por_el_linaje():
+    """En un fichero no hay ninguna columna que ordene versiones del mismo dato.
+
+    La clave (fichero, linea) es unica dentro de un fichero, y el registro de
+    control impide procesar dos veces el mismo contenido. Un duplicado solo
+    puede venir de un reproceso deliberado, y entonces la ingesta mas reciente
+    ES la buena. Que este test exista es para que la excepcion sea una decision
+    y no un descuido que nadie revisa.
+    """
+    spec = get_table("liquidaciones")
+    assert isinstance(spec.source, FileSource)
+    assert spec.dedup_order == ["_ingested_at"]
 
 
 # --------------------------------------------------------------- origenes ---

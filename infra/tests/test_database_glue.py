@@ -193,6 +193,9 @@ def test_solo_los_jobs_que_hablan_con_el_rds_llevan_connection(dev):
     assert "practica-dev-seed-rds" in con_connection
     assert "practica-dev-bronze-ingest" in con_connection
     assert "practica-dev-silver-transform" in sin_connection
+    # El de ficheros tampoco: que el origen sea de un tercero no significa que
+    # haya que meterlo en la VPC. Los ficheros ya estan en el bucket.
+    assert "practica-dev-bronze-files" in sin_connection
     assert "practica-dev-gold-build" in sin_connection
 
 
@@ -204,7 +207,13 @@ def test_los_jobs_de_iceberg_declaran_datalake_formats(dev):
         j["Properties"]["Name"]: j["Properties"]["DefaultArguments"]
         for j in glue_stack.find_resources("AWS::Glue::Job").values()
     }
-    for nombre in ("practica-dev-silver-transform", "practica-dev-gold-build"):
+    # bronze-files tambien escribe Iceberg: su registro de control de ficheros
+    # procesados es una tabla Iceberg.
+    for nombre in (
+        "practica-dev-silver-transform",
+        "practica-dev-gold-build",
+        "practica-dev-bronze-files",
+    ):
         assert jobs[nombre].get("--datalake-formats") == "iceberg", nombre
 
 

@@ -68,6 +68,15 @@ class GlueStack(Stack):
 
         self.seed_job = self._create_seed_job(bucket, secret_name, connection_name)
         self.bronze_job = self._create_bronze_job(bucket, secret_name, connection_name)
+        # Sin Connection, como silver y gold: lee de S3 y escribe en S3. Que
+        # el origen sean ficheros de un tercero no significa que haya que meter
+        # el job en la VPC; los ficheros ya estan en el bucket.
+        self.files_job = self._create_spark_job(
+            "BronzeFilesJob",
+            "bronze-files",
+            "Zona de aterrizaje: valida el pie de control de cada fichero y lo lleva a Bronze",
+            bucket,
+        )
         self.silver_job = self._create_spark_job(
             "SilverTransformJob",
             "silver-transform",
@@ -84,6 +93,7 @@ class GlueStack(Stack):
         CfnOutput(self, "GlueRoleArn", value=self.role.role_arn)
         CfnOutput(self, "SeedJobName", value=self.seed_job.ref)
         CfnOutput(self, "BronzeJobName", value=self.bronze_job.ref)
+        CfnOutput(self, "FilesJobName", value=self.files_job.ref)
         CfnOutput(self, "SilverJobName", value=self.silver_job.ref)
         CfnOutput(self, "GoldJobName", value=self.gold_job.ref)
         CfnOutput(

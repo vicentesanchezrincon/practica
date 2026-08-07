@@ -78,6 +78,10 @@ events: ## Genera la serie temporal de eventos web (necesita 'make seed' antes)
 events-daily: ## Un dia mas de trafico web: reenvios, eventos tardios y relojes desviados
 	$(IN_GLUE) 'python3 -m data_generator.eventos --mode daily'
 
+.PHONY: liquidaciones
+liquidaciones: ## Genera los ficheros de liquidacion del PSP en data/landing/
+	$(IN_GLUE) 'python3 -m data_generator.liquidaciones $(if $(DAYS),--days $(DAYS))'
+
 # ---------------------------------------------------------------- calidad ---
 
 .PHONY: test
@@ -220,6 +224,13 @@ export-seed: ## Exporta el Postgres local a Parquet y lo sube a S3
 	aws s3 sync data/_seed "s3://$(BUCKET)/_seed" --delete
 	@echo "Subido a s3://$(BUCKET)/_seed"
 
+.PHONY: upload-landing
+upload-landing: ## Deposita los ficheros de liquidacion en la zona de aterrizaje de S3
+	@test -n "$(BUCKET)" || (echo "No encuentro el bucket. ¿Has hecho 'make deploy-dev'?" && exit 1)
+	@test -d data/landing/liquidaciones || (echo "No hay ficheros. Lanza antes 'make liquidaciones'." && exit 1)
+	aws s3 sync data/landing "s3://$(BUCKET)/landing"
+	@echo "Depositados en s3://$(BUCKET)/landing"
+
 # Lanza un job de Glue, espera, y al terminar vuelca su salida.
 #
 # El `test -n` no es defensivo por gusto: si start-job-run falla (por ejemplo
@@ -253,6 +264,10 @@ seed-rds: ## Lanza el job de Glue que siembra el RDS y espera a que acabe
 bronze: ## Ingesta incremental del RDS a la capa Bronze (TABLES=orders,... opcional)
 	$(call run_glue_job,bronze-ingest,$(if $(TABLES),--arguments '{"--TABLES":"$(TABLES)"}'))
 
+.PHONY: files
+files: ## Procesa la zona de aterrizaje: valida el pie de cada fichero y carga Bronze
+	$(call run_glue_job,bronze-files)
+
 # El job de Silver solo informa de la calidad; la puerta la aplica quien
 # orquesta. En AWS eso es la maquina de estados; aqui, este target.
 .PHONY: silver
@@ -267,7 +282,7 @@ gold: ## Construye el modelo estrella en Gold
 	$(call run_glue_job,gold-build)
 
 .PHONY: pipeline
-pipeline: bronze silver gold ## Ejecuta el pipeline completo: Bronze -> Silver -> Gold
+pipeline: bronze files silver gold ## Ejecuta el pipeline completo: Bronze -> Silver -> Gold
 
 .PHONY: run
 run: ## Ejecuta la maquina de estados completa y espera a que termine
