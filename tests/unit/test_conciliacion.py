@@ -146,11 +146,16 @@ def test_un_dia_con_ventas_y_sin_liquidacion_aparece_en_el_informe(spark):
 
     El join es FULL OUTER justo por esto: con un `inner`, el dia desapareceria
     del informe y el problema seria literalmente invisible.
+
+    El dia sin fichero va EN MEDIO del periodo cubierto a proposito. Puesto al
+    final quedaria fuera de la ventana de conciliacion y el test pasaria por el
+    motivo equivocado.
     """
+    ultimo = date(2026, 3, 17)
     filas = por_dia(
         conciliar(
-            pedidos_df(spark, [(1, DIA, 100.0), (2, OTRO, 200.0)]),
-            liquidaciones_df(spark, [(DIA, "PAGO", 100.0, 2.15)]),
+            pedidos_df(spark, [(1, DIA, 100.0), (2, OTRO, 200.0), (3, ultimo, 50.0)]),
+            liquidaciones_df(spark, [(DIA, "PAGO", 100.0, 2.15), (ultimo, "PAGO", 50.0, 1.20)]),
         )
     )
     assert OTRO in filas
@@ -158,7 +163,7 @@ def test_un_dia_con_ventas_y_sin_liquidacion_aparece_en_el_informe(spark):
     assert filas[OTRO]["cuadra"] is False
 
 
-def test_un_dia_con_liquidacion_y_sin_ventas_tampoco_pasa(spark):
+def test_un_dia_con_liquidacion_y_sin_ventas_tampoco_pasa(spark):  # noqa: D401
     """Dinero que llega de ninguna parte: normalmente, un fichero procesado dos
     veces o con la fecha mal leida. No se puede calcular descuadre relativo
     —no hay denominador— y aun asi tiene que fallar."""
@@ -265,3 +270,52 @@ def test_el_resumen_es_serializable_a_json(spark):
         )
     )
     assert json.loads(json.dumps(cifras))["dias"] == 1
+
+
+# ------------------------------------------------- el periodo que se cubre ---
+
+
+def test_solo_se_concilia_el_periodo_que_el_proveedor_ha_liquidado(spark):
+    """Lo encontro la primera ejecucion real: 367 de 368 dias "descuadrados".
+
+    Los ficheros cubrian 60 dias y los pedidos un ano entero, asi que todo el
+    historico anterior salia al 100% de descuadre. Ese es el modo de fallo de
+    casi cualquier alarma de calidad: no que no detecte, sino que detecte tanto
+    que deje de mirarse.
+    """
+    antiguo = date(2026, 1, 10)
+    conciliacion = conciliar(
+        pedidos_df(spark, [(1, antiguo, 500.0), (2, DIA, 100.0)]),
+        liquidaciones_df(spark, [(DIA, "PAGO", 100.0, 2.15)]),
+    )
+    dias = por_dia(conciliacion)
+    assert antiguo not in dias, "un dia fuera de la cobertura no es un descuadre"
+    assert DIA in dias
+
+
+def test_un_dia_sin_liquidar_DENTRO_de_la_cobertura_si_es_un_fallo(spark):
+    """El recorte no puede tapar lo que se quiere detectar.
+
+    Un dia sin fichero en medio del periodo cubierto es exactamente el hueco en
+    la secuencia, y tiene que seguir apareciendo.
+    """
+    enmedio = date(2026, 3, 16)
+    dias = por_dia(
+        conciliar(
+            pedidos_df(spark, [(1, DIA, 100.0), (2, enmedio, 300.0), (3, date(2026, 3, 17), 50.0)]),
+            liquidaciones_df(
+                spark,
+                [(DIA, "PAGO", 100.0, 2.15), (date(2026, 3, 17), "PAGO", 50.0, 1.20)],
+            ),
+        )
+    )
+    assert enmedio in dias
+    assert dias[enmedio]["cuadra"] is False
+
+
+def test_sin_ninguna_liquidacion_no_se_recorta_nada(spark):
+    """El caso degenerado: si no ha llegado un solo fichero, no hay ventana que
+    aplicar y el informe tiene que ensenar los dias con ventas sin liquidar."""
+    dias = por_dia(conciliar(pedidos_df(spark, [(1, DIA, 100.0)]), liquidaciones_df(spark, [])))
+    assert DIA in dias
+    assert dias[DIA]["cuadra"] is False

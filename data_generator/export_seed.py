@@ -29,7 +29,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from common.config import INGESTION_ORDER, get_table
+from common.config import get_table, tablas_de
 from common.spark_session import build_session, jdbc_options_from_env
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-7s %(message)s")
@@ -65,7 +65,12 @@ def main() -> None:
     log.info("Origen:  %s", jdbc["url"])
     log.info("Destino: %s", destino)
 
-    tablas = [t.strip() for t in args.tables.split(",") if t.strip()] or INGESTION_ORDER
+    # Solo las tablas que viven en Postgres. La de liquidaciones tambien esta
+    # en INGESTION_ORDER, pero no sale de la base de datos: llega como ficheros
+    # y se sube con `make upload-landing`. Se filtra por el TIPO de origen y no
+    # por una lista de excepciones, para que una fuente nueva no obligue a
+    # acordarse de este fichero.
+    tablas = [t.strip() for t in args.tables.split(",") if t.strip()] or tablas_de("jdbc")
 
     total = 0
     for table in tablas:

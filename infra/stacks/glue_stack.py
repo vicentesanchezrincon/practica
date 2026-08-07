@@ -127,7 +127,14 @@ class GlueStack(Stack):
         # entorno: un job de dev no debe poder mover el watermark de prod.
         role.add_to_policy(
             iam.PolicyStatement(
-                actions=["ssm:GetParameter", "ssm:GetParameters", "ssm:PutParameter"],
+                actions=[
+                    "ssm:GetParameter",
+                    "ssm:GetParameters",
+                    "ssm:PutParameter",
+                    # La siembra los borra: despues de un TRUNCATE, una
+                    # marca de "ya lei hasta aqui" es una mentira.
+                    "ssm:DeleteParameter",
+                ],
                 resources=[
                     Stack.of(self).format_arn(
                         service="ssm",
@@ -284,6 +291,9 @@ class GlueStack(Stack):
                 # El nombre literal, no secret.secret_name: ese resuelve a una
                 # expresion que trocea el ARN por guiones.
                 "--SECRET_ID": secret_name,
+                # Lo necesita para invalidar los watermarks despues del
+                # TRUNCATE: viven en /practica/<entorno>/watermark/*.
+                "--ENVIRONMENT": self.environment_name,
                 "--SEED_PREFIX": f"s3://{bucket.bucket_name}/{SEED_PREFIX}",
                 "--DB_NAME": "ecommerce",
             },

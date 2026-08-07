@@ -68,6 +68,25 @@ def conciliar(pedidos: DataFrame, liquidaciones: DataFrame) -> DataFrame:
 
     unidos = por_pedidos.join(por_liquidacion, on="dia", how="full_outer")
 
+    # Solo se concilia el PERIODO CUBIERTO por el proveedor.
+    #
+    # Sin esto, cada dia anterior al primer fichero sale descuadrado al 100%,
+    # porque hay ventas y no hay liquidacion. Medido con datos reales: 367 de
+    # 368 dias "descuadrados", de los cuales 300 largos eran simplemente
+    # historico que el proveedor nunca liquido.
+    #
+    # Ese es el modo de fallo de casi toda alarma de calidad: no que no
+    # detecte, sino que detecte tanto que deje de mirarse. Un dia sin liquidar
+    # DENTRO de la ventana sigue siendo un fallo y sigue apareciendo; lo que se
+    # descarta es lo que nunca estuvo dentro del alcance.
+    cobertura = liquidaciones.agg(
+        F.min("fecha_operacion").alias("desde"), F.max("fecha_operacion").alias("hasta")
+    ).collect()[0]
+    if cobertura["desde"] is not None:
+        unidos = unidos.filter(
+            F.col("dia").between(F.lit(cobertura["desde"]), F.lit(cobertura["hasta"]))
+        )
+
     # Los ceros son deliberados y no cosmetica: con nulos, cualquier resta
     # posterior se propaga a NULL y el dia problematico DESAPARECE del informe,
     # que es justo el dia que hay que mirar.
