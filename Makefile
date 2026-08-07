@@ -70,6 +70,14 @@ seed: schema ## Carga historica inicial de datos sinteticos
 seed-daily: ## Simula un dia nuevo: inserts + updates + datos sucios
 	$(IN_GLUE) 'python3 data_generator/seed.py --mode daily'
 
+.PHONY: events
+events: ## Genera la serie temporal de eventos web (necesita 'make seed' antes)
+	$(IN_GLUE) 'python3 -m data_generator.eventos --mode initial $(if $(SESSIONS),--sessions $(SESSIONS))'
+
+.PHONY: events-daily
+events-daily: ## Un dia mas de trafico web: reenvios, eventos tardios y relojes desviados
+	$(IN_GLUE) 'python3 -m data_generator.eventos --mode daily'
+
 # ---------------------------------------------------------------- calidad ---
 
 .PHONY: test

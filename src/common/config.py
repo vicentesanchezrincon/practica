@@ -76,11 +76,30 @@ class JdbcSource(SourceSpec):
     schema: str = SOURCE_SCHEMA
 
     watermark_column: str = "updated_at"
-    """Columna que usa la extraccion incremental. Debe tener indice en origen."""
+    """Columna que usa la extraccion incremental. Debe tener indice en origen.
+
+    En una tabla de entidades es `updated_at`. En un flujo de eventos esa
+    columna no existe, y hay que elegir entre el momento en que el hecho
+    OCURRIO y el momento en que LLEGO. Ver `lookback`."""
 
     partition_column: str | None = None
-    """Columna numerica para paralelizar la lectura JDBC. Sin esto, Spark lee
-    la tabla entera con un solo hilo y el job tarda una eternidad."""
+    """Columna para paralelizar la lectura JDBC. Sin esto, Spark lee la tabla
+    entera con un solo hilo y el job tarda una eternidad.
+
+    Suele ser la PK numerica, pero no tiene por que: Spark tambien trocea por
+    fechas y timestamps, que es lo unico posible cuando la clave es un UUID."""
+
+    lookback: timedelta = timedelta(0)
+    """Cuanto se retrocede el watermark en cada ejecucion.
+
+    Existe por los datos que llegan tarde. Si la watermark es la hora de
+    llegada, no hace falta: lo que llega tarde llega igual, solo que despues.
+    Si es la hora del hecho, un evento de ayer que aparece hoy queda **por
+    detras de la marca y no se lee nunca**, sin ningun error.
+
+    El precio es releer un solapamiento en cada pasada, y por tanto duplicados
+    en Bronze. Es un precio pequeno: Bronze es append-only a proposito y Silver
+    deduplica. Perder filas si seria caro."""
 
     @property
     def bronze_namespace(self) -> str:
@@ -124,13 +143,24 @@ class TableSpec:
 
     dedup_order: list[str] = field(default_factory=list)
     """Columnas que deciden que fila sobrevive al dedup, de mas a menos
-    prioritaria, siempre descendente.
+    prioritaria.
 
     Se declara en vez de deducirse porque **la respuesta obvia solo existe en
     JDBC**: alli es la watermark, gana la fila modificada mas recientemente. En
     un origen append-only no hay ninguna columna que signifique "esta version es
     posterior a aquella", y elegirla mal borra datos buenos sin dar ni un
     error."""
+
+    dedup_keep: str = "ultima"
+    """Cual de las versiones empatadas sobrevive: "ultima" o "primera".
+
+    No es una preferencia estetica, son dos situaciones distintas:
+
+      * una fila **actualizada** varias veces entre dos ingestas -> la ultima
+        version es la buena, las anteriores estan obsoletas;
+      * un evento **reenviado** por un reintento -> el hecho ocurrio una sola
+        vez, y la primera llegada es la que dice cuando llego de verdad.
+        Quedarse con la ultima infla la latencia medida sin que nada falle."""
 
     # --- normalizacion (Silver) ---
     # Se aplica ANTES de validar, para no mandar a cuarentena una fila cuyo
@@ -221,9 +251,31 @@ ORDER_STATUS = ["pending", "paid", "shipped", "delivered", "cancelled", "returne
 COUNTRIES = ["ES", "PT", "FR", "IT", "DE", "NL"]
 CURRENCIES = ["EUR"]
 
+EVENT_TYPES = [
+    "page_view",
+    "product_view",
+    "add_to_cart",
+    "remove_from_cart",
+    "checkout_start",
+    "purchase",
+]
+DEVICES = ["movil", "escritorio", "tablet"]
+
+ANALYTICS_SCHEMA = "analytics"
+
+# Ventana de reproceso de los eventos. Cubre el peor retraso que produce el
+# generador (30 horas) con margen: un movil sin cobertura durante un fin de
+# semana entero sigue entrando.
+EVENT_LOOKBACK = timedelta(hours=48)
+
 # Holgura de las comprobaciones temporales. Postgres escribe created_at y
 # updated_at en el mismo INSERT, pero no en el mismo instante.
 CLOCK_TOLERANCE = timedelta(seconds=1)
+
+# La de los eventos es mucho mayor, y no por ser menos exigentes: el reloj lo
+# pone el movil del visitante. Unos minutos de desviacion son normales; unas
+# horas ya no, y eso es lo que se quiere cazar.
+CLIENT_CLOCK_TOLERANCE = timedelta(minutes=5)
 
 TABLES: dict[str, TableSpec] = {
     "customers": TableSpec(
@@ -292,9 +344,56 @@ TABLES: dict[str, TableSpec] = {
         },
         quarantine_threshold=0.05,
     ),
+    # ------------------------------------------------ la serie temporal ---
+    # Esta entrada es la que justifica todo el refactor de la Fase 10. Compara
+    # sus campos con los de arriba: casi ninguna suposicion se mantiene.
+    "web_events": TableSpec(
+        name="web_events",
+        source=JdbcSource(
+            schema=ANALYTICS_SCHEMA,
+            system="webshop_events",
+            # No hay `updated_at`: una fila nunca se modifica. De los dos
+            # tiempos que trae el evento se elige el de LLEGADA, no el del
+            # hecho. Con `event_time` como marca, un evento de ayer que aparece
+            # hoy nace ya por detras del watermark y no se lee jamas.
+            watermark_column="received_at",
+            # La clave es un UUID: no hay rango numerico que trocear. Spark
+            # tambien sabe paralelizar por timestamp, y aqui es la unica opcion.
+            partition_column="received_at",
+            # Aun leyendo por hora de llegada hace falta solapamiento: un lote
+            # puede escribirse en el origen mientras el job esta leyendo.
+            lookback=EVENT_LOOKBACK,
+        ),
+        business_key=["event_id"],
+        dedup_order=["received_at"],
+        # Un reenvio no es una version mas nueva del hecho: es el mismo hecho
+        # contado dos veces. Gana la primera llegada.
+        dedup_keep="primera",
+        lower_trim=["event_type", "device", "utm_source"],
+        # `customer_id` NO esta aqui, y es la diferencia mas importante con
+        # `orders`. La mayoria del trafico de una tienda es anonimo: exigirle
+        # cliente mandaria a cuarentena dos tercios de los datos buenos, y la
+        # tasa de cuarentena dejaria de significar nada.
+        not_null=["event_id", "event_time", "received_at", "session_id", "event_type"],
+        non_negative=["amount"],
+        ranges={"quantity": (None, 1000)},
+        allowed_values={"event_type": EVENT_TYPES, "device": DEVICES},
+        # Un evento no puede haber ocurrido despues de haber llegado. Con
+        # tolerancia amplia porque el reloj lo pone el movil del visitante, no
+        # el servidor, y desviarse unos minutos es de lo mas normal.
+        time_sanity=[TimeSanity("event_time", "received_at", CLIENT_CLOCK_TOLERANCE)],
+        references={
+            "customer_id": ("customers", "customer_id"),
+            "product_id": ("products", "product_id"),
+        },
+        quarantine_threshold=0.04,
+        # Por dias y no por meses: son ordenes de magnitud mas filas que
+        # `orders`, y practicamente toda consulta acota un rango de fechas.
+        silver_partition="days(event_time)",
+    ),
 }
 
-INGESTION_ORDER = ["customers", "products", "orders", "order_items"]
+INGESTION_ORDER = ["customers", "products", "orders", "order_items", "web_events"]
 """Orden de ingesta. Los padres antes que los hijos, para que la validacion
 de integridad referencial de Silver tenga contra que comparar."""
 

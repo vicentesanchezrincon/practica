@@ -70,9 +70,14 @@ def deduplicate(df: DataFrame, spec: TableSpec) -> DataFrame:
             f"debe sobrevivir cuando una clave de negocio aparece repetida."
         )
 
-    orden = [F.col(columna).desc() for columna in spec.dedup_order]
+    # "ultima" para filas que se actualizan (la version vieja esta obsoleta),
+    # "primera" para hechos reenviados (el hecho ocurrio una sola vez, y la
+    # primera llegada es la que dice cuando llego de verdad).
+    sentido = (lambda c: c.asc()) if spec.dedup_keep == "primera" else (lambda c: c.desc())
+
+    orden = [sentido(F.col(columna)) for columna in spec.dedup_order]
     if f"{LINEAGE_PREFIX}ingested_at" in df.columns:
-        orden.append(F.col(f"{LINEAGE_PREFIX}ingested_at").desc())
+        orden.append(sentido(F.col(f"{LINEAGE_PREFIX}ingested_at")))
 
     ventana = Window.partitionBy(*[F.col(k) for k in spec.business_key]).orderBy(*orden)
 

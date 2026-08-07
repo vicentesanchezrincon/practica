@@ -29,17 +29,24 @@ import shutil
 import sys
 from pathlib import Path
 
-from common.config import INGESTION_ORDER
+from common.config import INGESTION_ORDER, get_table
 from common.spark_session import build_session, jdbc_options_from_env
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-7s %(message)s")
 log = logging.getLogger("export")
 
+FILAS_POR_FICHERO = 500_000
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)  # fmt: skip
     p.add_argument("--output", default="data/_seed", help="directorio de salida")
-    p.add_argument("--schema", default="ecommerce", help="esquema de origen en Postgres")
+    p.add_argument(
+        "--tables",
+        default="",
+        help="lista separada por comas. Por defecto, todas las de INGESTION_ORDER. "
+        "Util para reexportar solo los eventos, que son las que mas pesan",
+    )
     return p.parse_args()
 
 
@@ -58,18 +65,27 @@ def main() -> None:
     log.info("Origen:  %s", jdbc["url"])
     log.info("Destino: %s", destino)
 
+    tablas = [t.strip() for t in args.tables.split(",") if t.strip()] or INGESTION_ORDER
+
     total = 0
-    for table in INGESTION_ORDER:
+    for table in tablas:
+        # El esquema sale de la propia tabla: los eventos viven en `analytics`
+        # y las cuatro maestras en `ecommerce`. Con un `--schema` global habria
+        # que ejecutar el script dos veces.
+        spec = get_table(table)
         df = (
             spark.read.format("jdbc")
             .options(**jdbc)
-            .option("dbtable", f"{args.schema}.{table}")
+            .option("dbtable", f"{spec.source.schema}.{table}")
             .load()
         )
         n = df.count()
-        # coalesce(1): son volumenes pequenos y un fichero por tabla se lee
-        # despues mucho mas rapido que doscientos ficheros diminutos.
-        df.coalesce(1).write.mode("overwrite").parquet(f"file://{destino}/{table}")
+        # Un fichero por tabla se lee mucho mas rapido que doscientos diminutos,
+        # pero coalesce(1) obliga a que todo pase por un solo ejecutor. Con los
+        # eventos, que son ordenes de magnitud mas filas, eso se atraganta: por
+        # encima del umbral se dejan varias particiones.
+        salida = df.coalesce(1) if n <= FILAS_POR_FICHERO else df.repartition(8)
+        salida.write.mode("overwrite").parquet(f"file://{destino}/{table}")
         log.info("%-12s  %8d filas", table, n)
         total += n
 
