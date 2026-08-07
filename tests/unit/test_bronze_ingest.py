@@ -18,7 +18,7 @@ pytest.importorskip("pyspark", reason="Ejecuta los tests dentro del contenedor G
 # Los jobs viven fuera del paquete `common`, asi que hay que ponerlos en el path.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src" / "jobs"))
 
-from common.config import SOURCE_SYSTEM, JdbcSource, get_table  # noqa: E402
+from common.config import INGESTION_ORDER, SOURCE_SYSTEM, JdbcSource, get_table  # noqa: E402
 from common.watermark import EPOCH, format  # noqa: E402
 
 MOMENTO = datetime(2026, 3, 15, 14, 30, 45, tzinfo=UTC)
@@ -88,7 +88,7 @@ def test_el_watermark_epoch_se_formatea_como_timestamp_valido():
     assert "+00:00" in texto
 
 
-@pytest.mark.parametrize("tabla", ["customers", "products", "orders", "order_items"])
+@pytest.mark.parametrize("tabla", INGESTION_ORDER)
 def test_toda_tabla_ingestable_declara_watermark_y_particion(tabla):
     """Sin columna de particion, Spark lee la tabla con un solo hilo; sin
     columna de watermark no hay incremental posible.

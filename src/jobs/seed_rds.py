@@ -23,12 +23,18 @@ import boto3
 from awsglue.utils import getResolvedOptions
 from pyspark.sql import SparkSession
 
+from common.config import INGESTION_ORDER, get_table
 from common.jdbc import connection_options, credentials, execute_sql
 
-# Orden de carga: los padres antes que los hijos.
-TABLES = ["customers", "products", "orders", "order_items"]
+# La lista de tablas y su orden salen del registro del pipeline, no de una
+# copia local. Antes habia aqui una segunda lista escrita a mano: sobrevivio
+# mientras las tablas fueron siempre las mismas cuatro, y anadir una quinta la
+# habria dejado fuera de la siembra sin que nada fallara.
+TABLES = INGESTION_ORDER
 
 # Columnas BIGSERIAL cuya secuencia hay que recolocar despues de la carga.
+# No todas las tablas tienen: los eventos se identifican con un UUID que genera
+# el cliente, asi que no hay ninguna secuencia que dejar descolocada.
 SEQUENCES = {
     "customers": "customer_id",
     "products": "product_id",
@@ -36,7 +42,11 @@ SEQUENCES = {
     "order_items": "order_item_id",
 }
 
-SCHEMA = "ecommerce"
+
+def cualificada(table: str) -> str:
+    """`esquema.tabla`. El esquema sale del origen declarado, porque ya no hay
+    uno solo: los eventos viven en `analytics` y el resto en `ecommerce`."""
+    return f"{get_table(table).source.schema}.{table}"
 
 
 def log(msg: str) -> None:
@@ -71,7 +81,7 @@ def main() -> None:
     execute_sql(
         spark,
         options,
-        f"TRUNCATE {', '.join(f'{SCHEMA}.{t}' for t in TABLES)} RESTART IDENTITY CASCADE",
+        f"TRUNCATE {', '.join(cualificada(t) for t in TABLES)} RESTART IDENTITY CASCADE",
     )
 
     # 3. Carga.
@@ -84,7 +94,7 @@ def main() -> None:
         (
             df.write.format("jdbc")
             .options(**options)
-            .option("dbtable", f"{SCHEMA}.{table}")
+            .option("dbtable", cualificada(table))
             # Sin batchsize, el driver hace un round-trip por fila y esto tarda
             # una eternidad.
             .option("batchsize", 5000)
@@ -101,8 +111,8 @@ def main() -> None:
     #    chocaria con una clave primaria que ya existe.
     log("Recolocando secuencias")
     setvals = "; ".join(
-        f"SELECT setval(pg_get_serial_sequence('{SCHEMA}.{t}', '{pk}'), "
-        f"coalesce((SELECT max({pk}) FROM {SCHEMA}.{t}), 1))"
+        f"SELECT setval(pg_get_serial_sequence('{cualificada(t)}', '{pk}'), "
+        f"coalesce((SELECT max({pk}) FROM {cualificada(t)}), 1))"
         for t, pk in SEQUENCES.items()
     )
     execute_sql(spark, options, setvals)
@@ -121,7 +131,7 @@ def main() -> None:
         en_destino = (
             spark.read.format("jdbc")
             .options(**options)
-            .option("dbtable", f"(SELECT count(*) AS n FROM {SCHEMA}.{table}) AS t")
+            .option("dbtable", f"(SELECT count(*) AS n FROM {cualificada(table)}) AS t")
             .load()
             .collect()[0]["n"]
         )

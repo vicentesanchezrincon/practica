@@ -61,6 +61,20 @@ def pending_stats(spark, options, spec, watermark) -> dict:
     return scalar_query(spark, options, sql)
 
 
+def limite(valor) -> str:
+    """Formatea un extremo del rango para `lowerBound`/`upperBound` de Spark.
+
+    Spark trocea rangos numericos y tambien temporales, que es lo unico posible
+    cuando la clave del origen es un UUID. Pero el limite viaja como cadena y
+    lo parsea el driver: un `str(datetime)` de Python produce
+    '2026-03-15 12:00:00+00:00', con dos puntos en el huso, que el parser de
+    timestamps de Spark no acepta. Hay que darle formato ISO explicito.
+    """
+    if isinstance(valor, datetime):
+        return valor.strftime("%Y-%m-%d %H:%M:%S.%f")
+    return str(valor)
+
+
 def read_incremental(spark, options, spec, watermark, stats) -> DataFrame:
     """Lee del origen solo lo que cambio desde el watermark."""
     origen = spec.source
@@ -76,8 +90,8 @@ def read_incremental(spark, options, spec, watermark, stats) -> DataFrame:
         # Spark trocea el rango [lo, hi] y lanza una consulta por trozo.
         reader = (
             reader.option("partitionColumn", origen.partition_column)
-            .option("lowerBound", str(stats["lo"]))
-            .option("upperBound", str(stats["hi"]))
+            .option("lowerBound", limite(stats["lo"]))
+            .option("upperBound", limite(stats["hi"]))
             .option("numPartitions", str(n_particiones))
         )
     log(f"  leyendo con {n_particiones} particion(es)")
@@ -102,19 +116,41 @@ def add_lineage(
     )
 
 
+def lectura_desde(spec, watermark: datetime) -> datetime:
+    """Desde donde se lee de verdad: el watermark menos la ventana de reproceso.
+
+    Sin ventana, cualquier fila que llegue al origen con una marca anterior a
+    la ultima leida es invisible para siempre. No falla nada: simplemente no
+    esta, y el hueco solo se nota cuando alguien cuadra los totales meses
+    despues.
+
+    A cambio se releen filas ya ingestadas. Es barato: Bronze es append-only a
+    proposito y Silver deduplica. La asimetria es toda la justificacion de la
+    ventana, releer cuesta unos segundos y perder datos cuesta una auditoria.
+    """
+    return watermark - spec.source.lookback
+
+
 def ingest_table(spark, options, store, table, bucket, batch_id, ingested_at) -> dict:
     spec = get_table(table)
     watermark = store.read(table)
-    log(f"{table}: desde {format(watermark)}")
+    desde = lectura_desde(spec, watermark)
+    if desde != watermark:
+        log(
+            f"{table}: desde {format(desde)} (watermark {format(watermark)} "
+            f"- ventana de {spec.source.lookback})"
+        )
+    else:
+        log(f"{table}: desde {format(watermark)}")
 
-    stats = pending_stats(spark, options, spec, watermark)
+    stats = pending_stats(spark, options, spec, desde)
     pendientes = stats["n"]
 
     if pendientes == 0:
         log(f"{table}: sin cambios")
         return {"tabla": table, "filas": 0, "watermark": format(watermark)}
 
-    df = read_incremental(spark, options, spec, watermark, stats)
+    df = read_incremental(spark, options, spec, desde, stats)
     df = add_lineage(df, batch_id, ingested_at, spec.source.system)
 
     destino = f"s3://{bucket}/bronze/{spec.bronze_path_suffix}"

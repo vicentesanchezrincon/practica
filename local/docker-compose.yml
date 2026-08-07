@@ -14,7 +14,14 @@ name: practica
 
 services:
   postgres:
-    image: postgres:16-alpine
+    # TimescaleDB es Postgres 16 con una extension: el esquema `ecommerce`
+    # sigue funcionando exactamente igual y ademas se puede declarar
+    # `analytics.web_events` como hypertable, que es lo que hace de historian.
+    #
+    # AWS diverge aqui a proposito: RDS **no ofrece la extension** en ninguna
+    # version. El DDL lo detecta y cae a tabla plana con indices BRIN, asi que
+    # el codigo de los jobs es el mismo en los dos sitios. Ver schema.sql.
+    image: timescale/timescaledb:2.17.2-pg16
     container_name: practica-postgres
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-ecommerce}
