@@ -7,37 +7,45 @@ dejaste.
 
 ## Dónde estás
 
-Las nueve fases están hechas. El proyecto llegó a la versión **1.0.0** y al
-ejercicio de hotfix.
+**7 de agosto de 2026.** Las nueve fases originales y las cuatro de la
+**ampliación** están cerradas. El pipeline tiene ahora **tres orígenes de
+naturaleza distinta**, no uno repetido.
 
-| Fase | Estado |
-|---|---|
-| 0 — Git Flow y protección de ramas | hecha |
-| 1 — Entorno local (Docker, generador) | PR #1 |
-| 2 — VPC, S3, Data Catalog | PR #2 |
-| 3 — RDS, Glue Connection, siembra | PR #3 |
-| 4 — Ingesta incremental a Bronze | PR #4 |
-| 5 — Silver: limpieza, cuarentena, MERGE | PR #5 |
-| 6 — Gold: modelo estrella y SCD2 | PR #6 |
-| 7 — Step Functions y puerta de calidad | PR #7 |
-| 8 — CI/CD con OIDC | PR #8 |
-| 9 — Release 1.0.0 y hotfix 1.0.1 | PR #9, #10, y los del hotfix |
+| Fase | Rama | Estado |
+|---|---|---|
+| 10 | `feature/source-spec` | Fusionada (PR #14), CI verde |
+| 11 | `feature/timescale-events` | Fusionada (PR #15), CI verde |
+| 12 | `feature/landing-files` | Fusionada (PR #16), CI verde |
+| 13 | `feature/gold-conciliacion` | PR #17 abierto |
 
-!!! IMPORTANTE
-**La infraestructura de dev sigue desplegada**, a propósito, para poder recorrer
-la arquitectura en la consola de AWS. Cuesta ~0,05 USD/hora. Cuando acabes:
+**El CI ya funciona.** La caída mayor de GitHub Actions que bloqueó la sesión
+anterior se resolvió; los tres PR de la ampliación se fusionaron con los tres
+jobs en verde y sin `--admin`. La ejecución confirmó lo que solo se había
+provocado a mano: `tests-glue` corre **209 tests con 0 saltados** dentro de la
+imagen de Glue.
+
+La infraestructura de dev **sigue desplegada**. Se destruye con `make
+destroy-dev`, esperando unos minutos tras el último job de Glue para evitar ENIs
+huérfanas.
+
+### Lo que hay que terminar
+
+**Bronze mezcla dos generaciones de datos.** Durante la verificación se
+re-sembró el RDS, y `seed-rds` hace `TRUNCATE ... RESTART IDENTITY`: los ids se
+reutilizan para filas distintas, así que el histórico de Bronze pasó a describir
+una base de datos que ya no existe. El síntoma es que `orders` sube al 7,69% de
+cuarentena y la conciliación reporta días con más pedidos que movimientos.
+
+No es un defecto del código: es el estado en que quedó el lake. Se arregla con
 
 ```bash
-make destroy-dev
+make reset-bronze      # pide confirmación explícita; borra s3://.../bronze/
+make bronze
+make silver FULL=1
+make gold
 ```
 
-Espera unos minutos tras el último job de Glue antes de destruir, o las ENIs
-huérfanas dejan el stack de red en `DELETE_FAILED`.
-
-`Practica-Cicd` **no** se destruye con ese comando, y está bien así: es gratis
-(solo IAM) y sin él no hay CI.
-
----
+En producción esto no se hace, porque en producción no se trunca el origen.
 
 ## Arrancar
 

@@ -22,13 +22,16 @@ Se lanza con:
 
 from __future__ import annotations
 
+import json
 import sys
 from datetime import UTC, datetime
 
+import boto3
 from awsglue.utils import getResolvedOptions
 from pyspark.sql import Column, DataFrame, SparkSession
 from pyspark.sql import functions as F
 
+from common.conciliacion import conciliar, resumen
 from common.config import catalog_database
 from common.dimensions import (
     FAR_FUTURE,
@@ -400,6 +403,151 @@ def build_agg_daily_sales(spark: SparkSession, environment: str, fct: DataFrame)
     return spark.table(full)
 
 
+# ------------------------------------------------ el embudo y la conciliacion ---
+
+
+def build_fct_sesion(spark: SparkSession, environment: str, dim_customer: DataFrame) -> DataFrame:
+    """Una fila por visita, enganchada a la dimension de cliente CONFORMADA.
+
+    Es el segundo hecho del mart y esta a un grano distinto del primero: una
+    visita, no una linea de pedido. Que los dos cuelguen de la MISMA
+    `dim_customer` es lo que permite preguntar "¿cuanto compran los clientes
+    que llegaron por newsletter?" sin duplicar la dimension ni mantener dos
+    definiciones de cliente que acabarian divergiendo.
+
+    Las visitas anonimas —dos tercios del trafico— caen en el miembro
+    desconocido. Con un INNER JOIN desaparecerian del embudo y la tasa de
+    conversion saldria disparatada, porque el denominador seria solo el trafico
+    identificado.
+    """
+    sesiones = silver(spark, environment, "web_sessions")
+
+    # La clave de la visita se resuelve a la version del cliente VIGENTE ese
+    # dia: el mismo as-of join que usa fct_order_items, por el mismo motivo.
+    con_cliente = as_of_join(
+        sesiones,
+        dim_customer,
+        natural_key="customer_id",
+        fact_date="session_start",
+        key_column="customer_key",
+    )
+
+    fct = con_cliente.select(
+        "session_key",
+        F.coalesce(F.col("customer_key"), F.lit(UNKNOWN_KEY)).alias("customer_key"),
+        F.to_date("session_start").alias("session_date"),
+        "session_start",
+        "session_end",
+        "duracion_segundos",
+        "eventos",
+        "productos_vistos",
+        "device",
+        "utm_source",
+        "anonima",
+        "anadio_al_carrito",
+        "inicio_compra",
+        "compro",
+        F.round(F.col("importe"), 2).alias("importe"),
+    )
+
+    full = gold_name(environment, "fct_sesion")
+    replace_table(fct, full, partition="months(session_date)")
+    log(f"fct_sesion: {fct.count()} visitas")
+    return spark.table(full)
+
+
+def build_agg_funnel_diario(spark: SparkSession, environment: str, fct: DataFrame) -> DataFrame:
+    """El embudo por dia, canal y dispositivo.
+
+    Las tasas se calculan aqui y no en la herramienta de BI a proposito: una
+    tasa de conversion es una division, y una division hecha sobre un agregado
+    ya agregado da la media de las medias, que no es la tasa. Dejandola
+    calculada al grano correcto, nadie puede equivocarse despues.
+    """
+    agg = (
+        fct.groupBy("session_date", "utm_source", "device")
+        .agg(
+            F.count("*").alias("visitas"),
+            F.sum(F.when(F.col("productos_vistos") > 0, 1).otherwise(0)).alias("con_producto"),
+            F.sum(F.when(F.col("anadio_al_carrito"), 1).otherwise(0)).alias("con_carrito"),
+            F.sum(F.when(F.col("inicio_compra"), 1).otherwise(0)).alias("con_checkout"),
+            F.sum(F.when(F.col("compro"), 1).otherwise(0)).alias("con_compra"),
+            F.round(F.sum("importe"), 2).alias("importe"),
+            F.round(F.avg("duracion_segundos"), 1).alias("duracion_media"),
+        )
+        .withColumn("tasa_conversion", F.round(F.col("con_compra") / F.col("visitas"), 4))
+        .withColumn(
+            "abandono_carrito",
+            # De los que llenaron el carrito, cuantos no compraron. Con cero
+            # carritos la tasa no existe: un 0 diria "nadie abandona", que es
+            # justo lo contrario de "no hay datos".
+            F.when(F.col("con_carrito") == 0, F.lit(None).cast("double")).otherwise(
+                F.round(1 - F.col("con_compra") / F.col("con_carrito"), 4)
+            ),
+        )
+    )
+
+    full = gold_name(environment, "agg_funnel_diario")
+    replace_table(agg, full, partition="months(session_date)")
+    log(f"agg_funnel_diario: {agg.count()} filas (dia x canal x dispositivo)")
+    return spark.table(full)
+
+
+def build_fct_liquidacion(spark: SparkSession, environment: str) -> DataFrame:
+    """Los movimientos del proveedor de pagos, al grano de la linea del fichero.
+
+    Se conserva `fichero` como atributo del hecho —una dimension degenerada— y
+    no como una dimension aparte: identifica el lote de origen y es lo primero
+    que se pregunta cuando un dia no cuadra, pero no tiene atributos propios
+    que merezcan una tabla.
+    """
+    liq = silver(spark, environment, "liquidaciones")
+
+    fct = liq.select(
+        "fichero",
+        "linea",
+        "fecha_liquidacion",
+        "fecha_operacion",
+        "order_id",
+        "tipo",
+        "metodo",
+        F.round(F.col("importe"), 2).alias("importe"),
+        F.round(F.col("comision"), 2).alias("comision"),
+        "concepto",
+    )
+
+    full = gold_name(environment, "fct_liquidacion")
+    replace_table(fct, full, partition="months(fecha_liquidacion)")
+    log(f"fct_liquidacion: {fct.count()} movimientos")
+    return spark.table(full)
+
+
+def build_agg_conciliacion(spark: SparkSession, environment: str) -> tuple[DataFrame, dict]:
+    """El cuadre diario entre lo que dice Postgres y lo que dice el proveedor.
+
+    Es la unica metrica del mart que cruza dos ORIGENES distintos, y por tanto
+    la unica capaz de detectar un fallo que ninguno de los dos ve por separado:
+    cada fuente es internamente coherente aunque falte un fichero entero.
+    """
+    pedidos = silver(spark, environment, "orders").filter(
+        F.col("status").isin("paid", "shipped", "delivered", "returned")
+    )
+    liquidaciones = silver(spark, environment, "liquidaciones")
+
+    agg = conciliar(pedidos, liquidaciones)
+
+    full = gold_name(environment, "agg_conciliacion_diaria")
+    replace_table(agg, full, partition="months(dia)")
+
+    cifras = resumen(spark.table(full))
+    log(
+        f"agg_conciliacion_diaria: {cifras['dias']} dias, "
+        f"{cifras['dias_descuadrados']} descuadrados "
+        f"(peor: {cifras['peor_descuadre']}, tolerancia {cifras['tolerancia']})"
+    )
+    return spark.table(full), cifras
+
+
 # ---------------------------------------------------------------------- main ---
 
 
@@ -418,6 +566,15 @@ def main() -> None:
     dim_customer = build_dim_customer(spark, environment)
     fct = build_fct_order_items(spark, environment, dim_customer, dim_product)
     build_agg_daily_sales(spark, environment, fct)
+
+    # El segundo hecho, a otro grano y colgando de la MISMA dim_customer. Eso
+    # es lo que la convierte en una dimension conformada y no en dos tablas
+    # que se llaman igual.
+    sesiones = build_fct_sesion(spark, environment, dim_customer)
+    build_agg_funnel_diario(spark, environment, sesiones)
+
+    build_fct_liquidacion(spark, environment)
+    _, conciliacion = build_agg_conciliacion(spark, environment)
 
     # Cuadre: los ingresos de Gold tienen que coincidir con la suma de las
     # lineas de Silver. Si no cuadran, algun join ha perdido o duplicado filas,
@@ -441,7 +598,58 @@ def main() -> None:
         )
 
     log("cuadre OK")
+
+    # Cuadre con el TERCERO. El de arriba compara Gold con Silver, es decir el
+    # pipeline consigo mismo: detecta joins que pierden o multiplican filas,
+    # pero no sabria decir que falta un fichero, porque lo que falta no esta en
+    # ninguno de los dos lados.
+    #
+    # Este compara lo que dice Postgres con lo que dice el proveedor de pagos.
+    # Es la unica comprobacion del proyecto que puede cazar un fichero que no
+    # llego, uno procesado dos veces, o una referencia cruzada sin normalizar:
+    # cada fuente por separado sigue siendo perfectamente coherente.
+    log("--- conciliacion con el proveedor de pagos ---")
+    log(f"  importe de pedidos:  {conciliacion['importe_pedidos']}")
+    log(f"  importe liquidado:   {conciliacion['importe_liquidado']}")
+    log(f"  comisiones:          {conciliacion['comisiones']}")
+    log(
+        f"  dias descuadrados:   {conciliacion['dias_descuadrados']}/{conciliacion['dias']} "
+        f"(peor {conciliacion['peor_descuadre']}, tolerancia {conciliacion['tolerancia']})"
+    )
+
+    # No se lanza excepcion: un descuadre NO invalida el mart. Los pedidos y las
+    # visitas son correctos aunque falte una liquidacion, y tumbar el job
+    # dejaria sin datos a quien no tiene nada que ver con el problema.
+    #
+    # Se publica como senal para que la maquina de estados avise, que es el
+    # mismo criterio que en Silver: el job informa, el orquestador decide.
+    escribir_senal_de_conciliacion(args["BUCKET"], conciliacion)
+
     spark.stop()
+
+
+CONCILIACION_KEY = "_quality/gold/conciliacion.json"
+
+
+def escribir_senal_de_conciliacion(bucket: str, cifras: dict) -> None:
+    """Deja el resultado de la conciliacion en S3, junto al de Silver.
+
+    Mismo patron que `_quality/silver/latest.json`: un JSON pequeno que Step
+    Functions puede leer con `CallAwsService` y evaluar con un `Choice`, sin
+    tener que parsear logs.
+    """
+    cuerpo = {
+        **cifras,
+        "generated_at": datetime.now(UTC).isoformat(),
+        "passed": cifras["dias_descuadrados"] == 0,
+    }
+    boto3.client("s3").put_object(
+        Bucket=bucket,
+        Key=CONCILIACION_KEY,
+        Body=json.dumps(cuerpo, indent=2).encode(),
+        ContentType="application/json",
+    )
+    log(f"  senal publicada en s3://{bucket}/{CONCILIACION_KEY}")
 
 
 if __name__ == "__main__":

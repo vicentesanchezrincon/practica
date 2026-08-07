@@ -268,6 +268,38 @@ TCP
 
 ---
 
+## 1.4 Siglas de series temporales y ficheros
+
+TSDB
+:   *Time Series Database*. Base de datos especializada en series temporales:
+    muchísimas escrituras en orden cronológico, casi ninguna actualización, y
+    consultas que siempre acotan un rango de tiempo. Es la familia de base de
+    datos que define al sector energético.
+
+PSP
+:   *Payment Service Provider*. La pasarela de pago. Liquida a comercio con uno
+    o varios días de retraso, descontando su comisión, y lo comunica en un
+    fichero diario.
+
+DST
+:   *Daylight Saving Time*. El horario de verano. Dos veces al año la hora local
+    deja de ser una función biyectiva del instante. Ver §11.
+
+UUID
+:   *Universally Unique Identifier*. Identificador de 128 bits que se genera sin
+    coordinación central. Lo puede generar el cliente, que es su gracia en un
+    flujo de eventos, y su maldición para paralelizar una lectura por rango.
+
+BRIN
+:   *Block Range Index*. Índice que guarda el rango de valores de cada bloque de
+    disco en vez de una entrada por fila. Ocupa órdenes de magnitud menos que un
+    btree y funciona muy bien cuando los datos llegan ya ordenados en el tiempo.
+
+CDC
+:   *Change Data Capture*. Capturar los cambios de una base de datos en vez de
+    releerla entera. Por watermark es la versión pobre y perfectamente válida;
+    la versión completa lee el log de transacciones.
+
 # 2. Nombres propios y herramientas
 
 Apache Spark
@@ -341,6 +373,23 @@ pre-commit
     errores triviales no lleguen ni al repositorio.
 
 ---
+
+TimescaleDB
+:   Extensión de PostgreSQL que convierte una tabla en *hypertable*: por dentro
+    se trocea en fragmentos por rango de tiempo, y por fuera se consulta como
+    una tabla normal. **RDS no la ofrece** en ninguna versión.
+
+OSIsoft PI System
+:   El *historian* clásico de la industria y de la energía. Propietario, caro y
+    omnipresente en plantas de generación.
+
+InfluxDB
+:   Base de datos de series temporales de código abierto, muy usada en
+    monitorización y en IoT.
+
+Amazon Timestream
+:   La TSDB gestionada de AWS. Sin servidores que administrar y con facturación
+    por escritura y consulta.
 
 # 3. Arquitecturas y patrones
 
@@ -1177,3 +1226,273 @@ que un bug ya conocido vuelve.
 
 La lección no es escribir más comentarios: es que **una advertencia en prosa no
 es una defensa**. Lo que impide que un error vuelva es una prueba.
+
+
+---
+
+# 12. Series temporales y flujos de eventos
+
+## Historian
+
+Un almacén de medidas: una fila por sensor y por instante, para siempre, y **no
+se actualiza jamás**. Es la base de datos característica del sector energético
+—contadores, telemetría de plantas, SCADA— y su forma es la de cualquier flujo
+de eventos.
+
+Lo que lo distingue de una tabla de entidades no es el volumen, es la
+**semántica**: en una tabla de entidades una fila representa algo que existe y
+cambia; en un historian representa algo que pasó y ya no cambia nunca.
+
+## Tiempo del evento y tiempo de proceso (*event time* vs *processing time*)
+
+Los dos tiempos que trae todo hecho: cuándo **ocurrió** y cuándo **llegó**.
+Coinciden casi siempre, y cuando no coinciden, la diferencia es donde vive todo
+el problema.
+
+Sirven para cosas distintas y no son intercambiables:
+
+| | Se usa para | Si se usa para lo otro |
+|---|---|---|
+| Tiempo del evento | Particionar, agregar, todo el análisis de negocio | La extracción incremental **pierde** lo que llega tarde |
+| Tiempo de proceso | La extracción incremental | Los agregados de negocio se descolocan de día |
+
+!!! clave "El fallo, en una frase"
+    Con el tiempo del **evento** como marca de la extracción, un hecho de ayer
+    que llega hoy nace ya por detrás de la marca y no se lee nunca. No falla
+    nada: simplemente no está.
+
+## Datos que llegan tarde (*late-arriving data*)
+
+Hechos que llegan después de que su periodo se haya cerrado: un móvil sin
+cobertura que sincroniza al recuperarla, un contador que se lee al mes
+siguiente, una corrección del emisor.
+
+No son una anomalía a filtrar, son el caso normal de cualquier origen
+distribuido. Obligan a decidir explícitamente hasta cuándo se acepta un dato
+atrasado, y qué se hace con el agregado que ya se publicó.
+
+## Ventana de reproceso (*lookback window*)
+
+Retroceder la marca de agua un margen fijo en cada ejecución, para volver a leer
+un solapamiento. Es lo que impide que un dato atrasado se pierda para siempre.
+
+El precio son duplicados deliberados aguas arriba, y es un precio pequeño
+cuando la capa cruda es *append-only* y la siguiente deduplica. La asimetría lo
+justifica entero: **releer cuesta segundos, perder datos cuesta una auditoría**.
+
+## Entrega «al menos una vez» (*at-least-once*)
+
+Garantía de casi todo sistema de mensajería: un hecho puede llegar repetido,
+pero no puede perderse. La alternativa —«como mucho una vez»— pierde datos, y
+«exactamente una vez» es carísima y a menudo una ilusión.
+
+La consecuencia práctica es que la deduplicación **no es opcional** y tiene que
+apoyarse en un identificador que genere el emisor, no el receptor.
+
+Ponerle una clave única a la tabla de entrada parece la solución y no lo es:
+convierte un duplicado en un error de inserción, y si el duplicado era el bueno,
+lo pierdes.
+
+## Sesionización
+
+Reconstruir una visita a partir de hechos sueltos, agrupando por actor y
+partiendo allí donde hay un hueco de inactividad mayor que un umbral. Es el
+patrón de «islas y huecos»: `lag` para medir el hueco, una marca en los que lo
+superan, y una suma acumulada que identifica cada isla.
+
+El identificador de sesión que manda el cliente **no delimita una visita**: vive
+en una cookie, y una cookie dura mucho más. Agrupar por él da sesiones de horas
+con pausas de horas dentro, y unas métricas creíbles y falsas.
+
+## *Downsampling*
+
+Reducir la resolución de una serie agregándola a un intervalo mayor: de
+diez-minutal a horaria, de horaria a diaria. Es lo que hace manejable un
+historian, y lo que hay que hacer con cuidado, porque **la media de las medias
+no es la media**.
+
+---
+
+# 13. Zona horaria
+
+## Hora local y UTC
+
+Regla que no tiene excepciones útiles: **se guarda en UTC y la hora local es una
+vista**. En UTC el tiempo avanza siempre, sin saltos ni repeticiones, y por eso
+es lo único sobre lo que se puede agrupar, deduplicar y comparar sin sorpresas.
+
+## Hora ambigua
+
+El día que el reloj se atrasa, una hora local **ocurre dos veces**, separadas por
+una hora real. Dos hechos con la misma hora local no son un duplicado: son
+momentos distintos. Deduplicar o agrupar por hora local se come la mitad, y no
+falla nada.
+
+## Hora inexistente
+
+El día que el reloj se adelanta, una hora local **no ocurre ninguna vez**. Una
+marca de tiempo ahí es imposible, y aun así la conversión a UTC devuelve algo en
+vez de fallar.
+
+!!! aviso "No es el mismo problema del revés"
+    Una duplica y la otra hace imposible, y la implementación evidente las
+    confunde: en Python el atributo `fold` cubre las dos, así que comparar los
+    desfases devuelve cierto en ambos casos. Lo que las separa es el **signo** de
+    la diferencia.
+
+## Días de 23 y 25 horas
+
+En el sector energético esto llega a ser normativo: los ficheros de medidas
+horarias declaran un día de 23 horas y otro de 25, con una columna extra que
+dice cuál de las dos lecturas de las 02:00 es. Cualquier código que dé por hecho
+que un día tiene 24 horas está mal dos días al año.
+
+---
+
+# 14. Ficheros de intercambio
+
+## Fichero multi-registro
+
+Un fichero con **varios esquemas dentro**, distinguidos por el primer campo:
+cabecera, detalles y pie. Leerlo como un CSV no da error: da columnas
+desplazadas y filas basura mezcladas con las buenas.
+
+Es la forma habitual de los ficheros regulados del sector energético, y su
+motivo es histórico: nacieron para cinta y para transmisiones que se podían
+cortar.
+
+## Pie de control (*trailer*)
+
+El último registro, con el recuento y las sumas de lo que el emisor dice haber
+mandado. Es la **única prueba de integridad** que existe en un fichero plano: uno
+truncado se lee perfectamente, porque las líneas que llegaron están bien
+formadas.
+
+Conviene comprobar las tres cosas y no solo el recuento. Un fichero con todos
+los registros pero mal sumado es peor que uno truncado: significa que el emisor
+y tú no estáis mirando lo mismo.
+
+## Zona de aterrizaje (*landing zone*)
+
+El sitio donde un tercero deposita ficheros y del que tú los recoges. Se
+conserva el original tal cual llegó, aunque su contenido ya esté cargado: ante
+una reclamación hay que poder enseñar exactamente lo que mandó el proveedor,
+byte a byte.
+
+## Cuarentena de lote
+
+Apartar un **fichero entero** en vez de fila a fila. Es lo correcto cuando la
+integridad se declara a nivel de fichero: media liquidación no es medio dato
+bueno, es un total que no cuadra.
+
+## Idempotencia por contenido
+
+Identificar un lote por el **hash de su contenido** y no por su nombre. Es lo
+único que reconoce una reexpedición bajo otro nombre, que es como llegan de
+verdad las reenvíos.
+
+Conviene registrar solo los lotes **aceptados**: uno rechazado tiene que poder
+reintentarse cuando el emisor lo mande completo.
+
+## Mojibake
+
+El texto que resulta de decodificar bytes con la codificación equivocada:
+`dañado` que se convierte en `da?ado`. No lanza ninguna excepción con la
+configuración por defecto de casi todo, así que viaja intacto hasta el informe
+final.
+
+## Fecha ambigua
+
+`03/04/2026` es el 3 de abril o el 4 de marzo según el formato. Leerla con el
+equivocado **no falla ningún día del mes menor o igual que 12**, con lo que el
+error parece intermitente y se descarta como cosa rara.
+
+---
+
+# 15. Conciliación
+
+## Conciliación
+
+Cuadrar lo que dice tu sistema con lo que dice un tercero. Es la única
+comprobación que puede detectar un fallo que ninguna de las dos fuentes ve por
+separado, porque **cada una sigue siendo internamente coherente**.
+
+Todo lo demás —cuadres entre capas, tests, puertas de calidad— compara el
+sistema consigo mismo.
+
+## Periodo cubierto
+
+El rango que el tercero ha liquidado de verdad. Conciliar fuera de él produce un
+muro de falsas alarmas: todo lo anterior al primer fichero sale descuadrado al
+100%.
+
+!!! clave "El modo de fallo de casi toda alarma de calidad"
+    No es que no detecte. Es que detecta tanto que deja de mirarse.
+
+## Cuadre bruto y cuadre neto
+
+El bruto compara importes antes de deducciones; el neto, después. Meter
+comisiones y devoluciones en el cuadre hace que **todos** los días salgan
+descuadrados por motivos perfectamente normales, y la señal deja de servir para
+lo único que importa: detectar dinero que falta o que sobra.
+
+## Dimensión conformada
+
+Una dimensión compartida por varios hechos, a granos distintos. Es lo que
+permite cruzar dos procesos de negocio en la misma pregunta sin mantener dos
+definiciones que acabarían divergiendo.
+
+Su contrario es la dimensión duplicada: dos tablas que se llaman igual, se
+parecen, y no dicen lo mismo.
+
+## Matriz de bus (*bus matrix*)
+
+La tabla de Kimball que cruza procesos de negocio con dimensiones, y marca
+cuáles comparte cada uno. Es la forma de ver de un vistazo qué preguntas se
+pueden responder cruzando dos hechos, y cuáles no.
+
+---
+
+# 16. Más modos de fallo genéricos
+
+## El registro heterogéneo
+
+Un registro declarativo del que todo el mundo itera, y al que se le añade una
+entrada de otra naturaleza. Todos los consumidores siguen compilando y todos
+revientan en ejecución, cada uno por su lado.
+
+No hay test que lo cace de la forma habitual: el fallo no está en una función
+que se pueda invocar, está **en la línea que elige sobre qué iterar**.
+
+El arreglo no es una lista de excepciones —que hay que acordarse de actualizar
+en cada sitio— sino que cada consumidor declare con qué tipos sabe tratar.
+
+## El estado externo que sobrevive al borrado
+
+Marcas de agua, punteros de *offset*, registros de control: estado que describe
+un origen y que vive **fuera** de él. Al reconstruir el origen, ese estado sigue
+ahí describiendo algo que ya no existe.
+
+El síntoma es que la extracción informa de «sin cambios», exactamente lo que
+informaría un día tranquilo, y el pipeline sigue corriendo sobre datos viejos
+hasta que alguien cuadra totales y no le salen.
+
+La regla: **quien invalida el estado debe ser quien lo rompe**, no quien se
+acuerde de llamarlo después.
+
+## El umbral que se cumple por los pelos
+
+Un límite de calidad que la medición real roza exactamente —4,00% con el umbral
+en 4%— no está calibrado, ha tenido suerte. Fallará sin que haya cambiado nada.
+
+Un umbral se pone a partir de la línea base observada **más un margen**, y el
+margen es la parte que casi nadie escribe.
+
+## El tipo que el motor no modela
+
+Spark no tiene tipo UUID; lo lee y lo escribe como texto, y el driver de destino
+se niega a convertirlo aunque el valor sea válido. La familia es más amplia:
+intervalos, tipos geométricos, enumerados nativos, `jsonb`.
+
+Solo aparece la primera vez que una tabla usa uno de ellos, y hasta entonces
+todo funciona.

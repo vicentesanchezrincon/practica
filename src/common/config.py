@@ -429,7 +429,13 @@ TABLES: dict[str, TableSpec] = {
             "customer_id": ("customers", "customer_id"),
             "product_id": ("products", "product_id"),
         },
-        quarantine_threshold=0.04,
+        # Medido contra los datos reales del generador: 4,00% exacto, con el
+        # umbral en 4%. Paso por los pelos, y eso es suerte y no calibracion.
+        # 6% deja margen para la variacion normal entre lotes sin dejar de
+        # cazar una degradacion de verdad. Un umbral que se cumple por un
+        # margen de cero es un umbral que fallara el martes que viene sin que
+        # haya cambiado nada.
+        quarantine_threshold=0.06,
         # Por dias y no por meses: son ordenes de magnitud mas filas que
         # `orders`, y practicamente toda consulta acota un rango de fechas.
         silver_partition="days(event_time)",
@@ -521,6 +527,22 @@ class Layout:
 def catalog_database(layer: str, environment: str = "dev") -> str:
     """Nombre de la base en el Glue Data Catalog. Ej: practica_dev_silver."""
     return f"practica_{environment}_{layer}"
+
+
+def tablas_de(kind: str) -> list[str]:
+    """Las tablas de `INGESTION_ORDER` cuyo origen es de ese tipo.
+
+    Existe porque no todo lo que esta en el registro se obtiene igual, y varias
+    herramientas solo saben tratar con uno de los tipos: la siembra del RDS y
+    el exportador a Parquet hablan JDBC y no tienen nada que hacer con un
+    fichero, que llega por su cuenta a la zona de aterrizaje.
+
+    Se pregunta por el TIPO y no se mantiene una lista de excepciones, para que
+    anadir una fuente nueva no obligue a acordarse de cada sitio que la
+    excluye. La primera version no hacia esto y dos jobs distintos reventaron
+    con el mismo AttributeError en la misma ejecucion.
+    """
+    return [t for t in INGESTION_ORDER if TABLES[t].source.kind == kind]
 
 
 def get_table(name: str) -> TableSpec:

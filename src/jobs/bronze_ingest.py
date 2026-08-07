@@ -28,7 +28,7 @@ from awsglue.utils import getResolvedOptions
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
-from common.config import INGESTION_ORDER, SOURCE_SYSTEM, get_table
+from common.config import SOURCE_SYSTEM, get_table, tablas_de
 from common.jdbc import connection_options, credentials, scalar_query
 from common.watermark import WatermarkStore, format
 
@@ -174,8 +174,12 @@ def main() -> None:
         sys.argv,
         ["JOB_NAME", "ENVIRONMENT", "BUCKET", "SECRET_ID", "DB_NAME"],
     )
-    # --TABLES es opcional: sin el se ingestan todas, en el orden declarado.
-    tables = INGESTION_ORDER
+    # --TABLES es opcional: sin el se ingestan todas las de JDBC, en el orden
+    # declarado. Solo las de JDBC: los ficheros del proveedor de pagos tienen
+    # su propio job, porque no hay watermark que consultar ni consulta que
+    # trocear. Preguntar por el TIPO y no llevar una lista de excepciones es lo
+    # que evita que una fuente nueva rompa este job sin que nadie lo toque.
+    tables = tablas_de("jdbc")
     if "--TABLES" in sys.argv:
         extra = getResolvedOptions(sys.argv, ["TABLES"])
         tables = [t.strip() for t in extra["TABLES"].split(",") if t.strip()]

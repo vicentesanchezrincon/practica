@@ -41,6 +41,19 @@ def connection_options(secret: dict, db_name: str) -> dict[str, str]:
         "user": secret["username"],
         "password": secret["password"],
         "driver": DRIVER,
+        # Sin esto, escribir una columna UUID desde Spark falla con
+        # "column is of type uuid but expression is of type character varying".
+        #
+        # Spark no tiene tipo UUID: lo lee y lo escribe como texto. Por defecto
+        # el driver de Postgres declara los parametros de texto como VARCHAR y
+        # se niega a convertirlos, aunque el valor sea un UUID perfectamente
+        # valido. Con `unspecified` deja que el servidor infiera el tipo por el
+        # destino, que es lo que hace psql y lo que uno esperaria.
+        #
+        # Es de esos ajustes que no se descubren leyendo: aparecen la primera
+        # vez que una tabla usa un tipo que Spark no modela, y hasta entonces
+        # todo funciona.
+        "stringtype": "unspecified",
     }
 
 

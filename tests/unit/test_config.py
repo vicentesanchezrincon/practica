@@ -7,6 +7,7 @@ y sirven de red de seguridad cuando anadas tablas nuevas a TABLES.
 from __future__ import annotations
 
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
@@ -21,6 +22,7 @@ from common.config import (
     SourceSpec,
     catalog_database,
     get_table,
+    tablas_de,
 )
 
 
@@ -164,3 +166,67 @@ def test_el_nombre_de_la_base_del_catalogo_separa_entornos():
 
 def test_el_umbral_de_cuarentena_es_un_porcentaje():
     assert 0 < QUARANTINE_THRESHOLD < 1
+
+
+def test_el_exportador_solo_recorre_las_tablas_que_estan_en_postgres():
+    """`export_seed.py` recorre INGESTION_ORDER, que ahora tiene tablas que NO
+    salen de la base de datos.
+
+    Lo encontro una ejecucion real, no la suite: el exportador pidio el esquema
+    de un origen de ficheros y reviento con un AttributeError. Se filtra por el
+    TIPO de origen y no por una lista de excepciones, para que una fuente nueva
+    no obligue a acordarse de aquel fichero.
+    """
+    de_postgres = tablas_de("jdbc")
+    assert "liquidaciones" not in de_postgres
+    assert "web_events" in de_postgres
+    for tabla in de_postgres:
+        assert get_table(tabla).source.schema
+
+
+def test_ningun_job_recorre_el_registro_entero_a_ciegas():
+    """El fallo que se repitio TRES veces en la misma ejecucion.
+
+    `INGESTION_ORDER` dejo de ser homogeneo en cuanto entro un origen de
+    ficheros: `seed_rds`, `export_seed` y `bronze_ingest` lo recorrian entero y
+    los tres reventaron con un AttributeError al pedirle a un fichero un
+    esquema, o una watermark, o una ventana de reproceso.
+
+    Todos hablan JDBC, asi que todos tienen que declararlo. Este test lee el
+    codigo fuente porque el fallo no esta en una funcion que se pueda invocar:
+    esta en la linea que elige sobre que iterar.
+    """
+    raiz = Path(__file__).resolve().parents[2]
+    consumidores = [
+        raiz / "src" / "jobs" / "bronze_ingest.py",
+        raiz / "src" / "jobs" / "seed_rds.py",
+        raiz / "data_generator" / "export_seed.py",
+    ]
+    for fichero in consumidores:
+        codigo = fichero.read_text()
+        assert 'tablas_de("jdbc")' in codigo, (
+            f"{fichero.name} tiene que declarar que solo trata origenes JDBC. "
+            f"Recorrer INGESTION_ORDER entero revienta con la primera fuente "
+            f"que no sea una tabla."
+        )
+        # Se busca la ITERACION, no la mencion: en los comentarios y en los
+        # textos de ayuda el nombre puede seguir apareciendo, y de hecho debe.
+        for patron in ("= INGESTION_ORDER", "in INGESTION_ORDER"):
+            assert patron not in codigo, (
+                f"{fichero.name} itera sobre INGESTION_ORDER entero, y ya no "
+                f"todas sus tablas se obtienen igual."
+            )
+
+
+def test_silver_si_recorre_el_registro_entero_y_esta_bien():
+    """El contraste que hace util al test anterior.
+
+    Silver lee de Bronze, y en Bronze todas las tablas son ya lo mismo:
+    ficheros Parquet en una ruta. Le da igual como llegaron. Es el unico
+    consumidor al que el tipo de origen no le afecta, y por eso es el unico que
+    puede recorrer el registro entero.
+    """
+    codigo = (
+        Path(__file__).resolve().parents[2] / "src" / "jobs" / "silver_transform.py"
+    ).read_text()
+    assert "INGESTION_ORDER" in codigo

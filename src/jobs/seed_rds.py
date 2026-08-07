@@ -23,14 +23,18 @@ import boto3
 from awsglue.utils import getResolvedOptions
 from pyspark.sql import SparkSession
 
-from common.config import INGESTION_ORDER, get_table
+from common.config import get_table, tablas_de
 from common.jdbc import connection_options, credentials, execute_sql
+from common.watermark import WatermarkStore
 
 # La lista de tablas y su orden salen del registro del pipeline, no de una
 # copia local. Antes habia aqui una segunda lista escrita a mano: sobrevivio
 # mientras las tablas fueron siempre las mismas cuatro, y anadir una quinta la
 # habria dejado fuera de la siembra sin que nada fallara.
-TABLES = INGESTION_ORDER
+#
+# Solo las de JDBC: este job siembra una base de datos, y los ficheros del
+# proveedor de pagos llegan por su cuenta a la zona de aterrizaje.
+TABLES = tablas_de("jdbc")
 
 # Columnas BIGSERIAL cuya secuencia hay que recolocar despues de la carga.
 # No todas las tablas tienen: los eventos se identifican con un UUID que genera
@@ -60,7 +64,9 @@ def read_s3_text(uri: str) -> str:
 
 
 def main() -> None:
-    args = getResolvedOptions(sys.argv, ["JOB_NAME", "SECRET_ID", "SEED_PREFIX", "DB_NAME"])
+    args = getResolvedOptions(
+        sys.argv, ["JOB_NAME", "ENVIRONMENT", "SECRET_ID", "SEED_PREFIX", "DB_NAME"]
+    )
 
     spark = SparkSession.builder.appName(args["JOB_NAME"]).getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
@@ -142,6 +148,24 @@ def main() -> None:
 
     if problemas:
         raise RuntimeError("El RDS no coincide con lo cargado: " + "; ".join(problemas))
+
+    # 6. Invalidar los watermarks.
+    #
+    #    Este job acaba de TRUNCAR el origen y volver a cargarlo. Cualquier
+    #    marca anterior dice "ya lei hasta aqui" sobre unos datos que ya no
+    #    existen, y los nuevos suelen tener fechas mas antiguas: la extraccion
+    #    incremental los da por vistos y NO LOS LEE NUNCA.
+    #
+    #    No falla nada. Bronze informa de "sin cambios", igual que un dia
+    #    tranquilo, y el pipeline sigue corriendo sobre datos viejos. Se
+    #    descubrio cuadrando la conciliacion: habia dias con cobros del
+    #    proveedor y cero pedidos, porque las liquidaciones eran nuevas y los
+    #    pedidos de Silver eran del lote anterior.
+    #
+    #    Lo hace el job y no el Makefile a proposito: quien invalida el estado
+    #    debe ser quien lo rompe, no quien se acuerde de llamarlo despues.
+    borradas = WatermarkStore(args["ENVIRONMENT"]).reset(TABLES)
+    log(f"Watermarks invalidados: {', '.join(borradas) if borradas else 'no habia ninguno'}")
 
     log(f"Listo: {total} filas en total, verificadas contra el RDS.")
     spark.stop()

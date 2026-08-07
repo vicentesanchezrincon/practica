@@ -34,6 +34,14 @@ class FakeSsm:
         self.params[Name] = Value
         self.puts.append((Name, Value))
 
+    def delete_parameter(self, Name: str):  # noqa: N803
+        if Name not in self.params:
+            raise ClientError(
+                {"Error": {"Code": "ParameterNotFound", "Message": "no existe"}},
+                "DeleteParameter",
+            )
+        del self.params[Name]
+
 
 @pytest.fixture
 def ssm():
@@ -124,3 +132,40 @@ def test_el_watermark_solo_se_escribe_cuando_se_lo_pedimos(ssm):
     store.read("orders")
     store.read("customers")
     assert ssm.puts == []
+
+
+def test_al_reconstruir_el_origen_se_borran_las_marcas():
+    """Despues de un TRUNCATE, una marca de "ya lei hasta aqui" es mentira.
+
+    Los datos nuevos suelen tener fechas anteriores a la marca vieja, asi que
+    la extraccion incremental los da por vistos y NO LOS LEE NUNCA. No falla
+    nada: Bronze informa de "sin cambios", igual que un dia tranquilo.
+
+    Se descubrio cuadrando la conciliacion contra el proveedor de pagos: habia
+    dias con cobros y CERO pedidos, porque las liquidaciones eran nuevas y los
+    pedidos de Silver eran del lote anterior.
+    """
+    store = WatermarkStore("dev", client=FakeSsm())
+    store.write("orders", datetime(2026, 8, 6, tzinfo=UTC))
+    store.write("customers", datetime(2026, 8, 6, tzinfo=UTC))
+
+    assert sorted(store.reset(["orders", "customers"])) == ["customers", "orders"]
+    assert store.read("orders") == EPOCH
+
+
+def test_borrar_una_marca_que_no_existe_no_falla():
+    """La primera siembra de un entorno nuevo no tiene ninguna. Fallar ahi
+    convertiria el caso normal en un error."""
+    store = WatermarkStore("dev", client=FakeSsm())
+    assert store.reset(["orders"]) == []
+
+
+def test_solo_se_borran_las_marcas_pedidas():
+    """Un reset indiscriminado obligaria a releer el historico entero de las
+    tablas que nadie ha tocado."""
+    store = WatermarkStore("dev", client=FakeSsm())
+    store.write("orders", datetime(2026, 8, 6, tzinfo=UTC))
+    store.write("products", datetime(2026, 8, 6, tzinfo=UTC))
+
+    store.reset(["orders"])
+    assert store.read("products") == datetime(2026, 8, 6, tzinfo=UTC)

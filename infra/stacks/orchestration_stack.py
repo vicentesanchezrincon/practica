@@ -51,6 +51,7 @@ class OrchestrationStack(Stack):
         environment: str,
         bucket: s3.IBucket,
         bronze_job: glue.CfnJob,
+        files_job: glue.CfnJob,
         silver_job: glue.CfnJob,
         gold_job: glue.CfnJob,
         alert_email: str | None = None,
@@ -61,7 +62,7 @@ class OrchestrationStack(Stack):
         self.environment_name = environment
         self.topic = self._create_topic(alert_email)
 
-        definicion = self._build_definition(bucket, bronze_job, silver_job, gold_job)
+        definicion = self._build_definition(bucket, bronze_job, files_job, silver_job, gold_job)
 
         self.state_machine = sfn.StateMachine(
             self,
@@ -129,10 +130,12 @@ class OrchestrationStack(Stack):
         self,
         bucket: s3.IBucket,
         bronze_job: glue.CfnJob,
+        files_job: glue.CfnJob,
         silver_job: glue.CfnJob,
         gold_job: glue.CfnJob,
     ) -> sfn.IChainable:
         bronze = self._glue_task("Bronze", bronze_job, "Extraccion incremental del RDS")
+        ficheros = self._glue_task("BronzeFicheros", files_job, "Zona de aterrizaje del PSP")
         silver = self._glue_task("Silver", silver_job, "Limpieza, cuarentena y MERGE")
         gold = self._glue_task("Gold", gold_job, "Modelo estrella")
 
@@ -199,11 +202,35 @@ class OrchestrationStack(Stack):
         # revienta deja la ejecucion en rojo y nadie se entera hasta que alguien
         # mira la consola.
         manejo_de_errores = alerta_fallo.next(fallo)
-        for estado in (bronze, silver, leer_informe):
+        for estado in (silver, leer_informe):
             estado.add_catch(manejo_de_errores, errors=["States.ALL"], result_path="$.error")
         gold.add_catch(manejo_de_errores, errors=["States.ALL"], result_path="$.error")
 
-        return bronze.next(silver).next(leer_informe).next(puerta)
+        # Las dos ingestas son INDEPENDIENTES: una lee el RDS por JDBC y la
+        # otra ficheros de S3. No comparten ni origen ni destino, asi que
+        # encadenarlas solo suma sus tiempos.
+        #
+        # Hasta la Fase 12 no habia nada que paralelizar y el estado Parallel
+        # habria sido complejidad sin ganancia; esta documentado como decision
+        # consciente. Ahora hay dos ramas de verdad y la decision cambia.
+        #
+        # Ojo con el ResultPath: un Parallel devuelve un ARRAY con el resultado
+        # de cada rama, y sin descartarlo machacaria la entrada de Silver.
+        ingesta = (
+            sfn.Parallel(
+                self,
+                "Ingesta",
+                comment="Las dos fuentes entran a la vez: no comparten nada",
+                result_path=sfn.JsonPath.DISCARD,
+            )
+            .branch(bronze)
+            .branch(ficheros)
+        )
+        # El catch va en el Parallel y no en cada rama: si una falla, la otra no
+        # tiene sentido por su cuenta, porque Silver las necesita a las dos.
+        ingesta.add_catch(manejo_de_errores, errors=["States.ALL"], result_path="$.error")
+
+        return ingesta.next(silver).next(leer_informe).next(puerta)
 
     # ------------------------------------------------------------ programado ---
 

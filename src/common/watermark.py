@@ -56,6 +56,30 @@ class WatermarkStore:
             raise
         return parse(valor)
 
+    def reset(self, tables: list[str]) -> list[str]:
+        """Borra las marcas de esas tablas. Devuelve las que existian.
+
+        Hace falta cuando el ORIGEN se reconstruye. Una marca dice "ya lei
+        hasta aqui", y despues de un TRUNCATE eso es mentira: los datos nuevos
+        pueden tener fechas anteriores, y entonces la extraccion incremental
+        los considera ya vistos y **no los lee jamas**.
+
+        No falla nada. Bronze informa de "sin cambios", que es exactamente lo
+        que informaria un dia tranquilo, y el pipeline sigue corriendo sobre
+        datos viejos hasta que alguien cuadra totales y no le salen.
+        """
+        borradas = []
+        for tabla in tables:
+            try:
+                self._client.delete_parameter(Name=parameter_name(tabla, self.environment))
+                borradas.append(tabla)
+            except ClientError as error:
+                # Que no exista es lo normal la primera vez que se siembra un
+                # entorno. Cualquier otro error si tiene que subir.
+                if error.response["Error"]["Code"] != "ParameterNotFound":
+                    raise
+        return borradas
+
     def write(self, table: str, value: datetime) -> None:
         """Guarda el watermark. Solo debe llamarse si la escritura fue bien.
 
