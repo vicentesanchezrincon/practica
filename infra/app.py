@@ -95,6 +95,7 @@ orchestration = OrchestrationStack(
     env=env,
     bucket=storage.bucket,
     bronze_job=glue_stack.bronze_job,
+    files_job=glue_stack.files_job,
     silver_job=glue_stack.silver_job,
     gold_job=glue_stack.gold_job,
     # Opcional: cdk deploy ... -c alert_email=tu@correo.com

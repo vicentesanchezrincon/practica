@@ -64,6 +64,7 @@ def build(environment: str = "dev", alert_email: str | None = None):
         env=ENV,
         bucket=storage.bucket,
         bronze_job=glue_stack.bronze_job,
+        files_job=glue_stack.files_job,
         silver_job=glue_stack.silver_job,
         gold_job=glue_stack.gold_job,
         alert_email=alert_email,
@@ -105,12 +106,35 @@ def test_los_tres_jobs_estan_en_el_pipeline(dev):
         assert f'"{estado}"' in asl
 
 
-def test_el_orden_es_bronze_silver_gold(dev):
-    """Silver lee lo que Bronze escribio y Gold lo que Silver dejo. Ejecutarlos
-    en otro orden produce resultados incompletos sin dar ningun error."""
+def test_el_orden_es_ingesta_silver_gold(dev):
+    """Silver lee lo que la ingesta escribio y Gold lo que Silver dejo.
+    Ejecutarlos en otro orden produce resultados incompletos sin dar error."""
     asl = definicion(dev)
-    assert '"Bronze":{"Next":"Silver"' in asl
+    assert '"StartAt":"Ingesta"' in asl
+    assert '"Ingesta":{"Type":"Parallel"' in asl
     assert '"Silver":{"Next":"LeerInformeDeCalidad"' in asl
+
+
+def test_las_dos_ingestas_corren_a_la_vez(dev):
+    """No comparten ni origen ni destino: una lee el RDS por JDBC y la otra
+    ficheros de S3. Encadenarlas solo sumaria sus tiempos.
+
+    Hasta la Fase 12 no habia nada que paralelizar y el estado Parallel habria
+    sido complejidad sin ganancia. Con dos ramas de verdad, la decision cambia.
+    """
+    asl = definicion(dev)
+    assert '"StartAt":"Bronze"' in asl
+    assert '"StartAt":"BronzeFicheros"' in asl
+    assert '"Ingesta":{"Next":"Silver"' in asl or '"Next":"Silver"' in asl
+
+
+def test_el_parallel_descarta_su_resultado(dev):
+    """Un Parallel devuelve un ARRAY con el resultado de cada rama. Sin
+    descartarlo machacaria la entrada de Silver, y el fallo aparece en
+    ejecucion, no en el synth."""
+    asl = definicion(dev)
+    ingesta = asl.split('"Ingesta":{')[1].split('"Branches"')[0]
+    assert '"ResultPath":null' in ingesta
 
 
 # ------------------------------------------------------------------ sync ---
