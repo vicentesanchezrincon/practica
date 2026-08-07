@@ -40,7 +40,6 @@ from pyspark.sql.utils import AnalysisException
 from common.config import (
     INGESTION_ORDER,
     QUARANTINE_THRESHOLD,
-    SOURCE_SCHEMA,
     TableSpec,
     catalog_database,
     get_table,
@@ -74,7 +73,7 @@ def read_bronze(spark: SparkSession, bucket: str, spec: TableSpec, ingestion_dat
     Devuelve None si no hay nada que leer: una tabla sin cambios ese dia no
     tiene particion, y eso no es un error.
     """
-    base = f"s3://{bucket}/bronze/{SOURCE_SCHEMA}/{spec.name}"
+    base = f"s3://{bucket}/bronze/{spec.bronze_path_suffix}"
     ruta = base if ingestion_date is None else f"{base}/ingestion_date={ingestion_date}"
 
     try:

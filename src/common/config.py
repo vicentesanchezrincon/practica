@@ -1,14 +1,29 @@
 """Configuracion declarativa del pipeline.
 
-Un solo sitio define, por tabla: la clave de negocio, la columna de watermark
-y las reglas de calidad. Los tres jobs (bronze, silver, gold) leen de aqui,
-asi que anadir una tabla nueva al pipeline es anadir una entrada a TABLES,
-no tocar codigo de Spark.
+Un solo sitio define, por tabla: de donde se saca, cual es su clave de negocio
+y que reglas de calidad tiene que cumplir. Los tres jobs (bronze, silver, gold)
+leen de aqui, asi que anadir una tabla al pipeline es anadir una entrada a
+TABLES, no tocar codigo de Spark.
+
+Hay dos cosas distintas en juego y conviene no mezclarlas:
+
+  * **Como se OBTIENE** una tabla  -> `SourceSpec` y sus subclases.
+    Es especifico del tipo de origen: una watermark y una columna de particion
+    son conceptos de una lectura JDBC y no significan nada en un fichero.
+  * **Como se VALIDA** una tabla   -> el resto de `TableSpec`.
+    Es igual para cualquier origen: un email mal escrito lo esta viniera de
+    donde viniera.
+
+Hasta la Fase 9 esas dos cosas vivian juntas en `TableSpec`, y no se notaba
+porque todos los origenes eran la misma tabla Postgres con `updated_at`. Con un
+segundo tipo de origen la costura salta a la vista.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import timedelta
+from typing import ClassVar
 
 SOURCE_SYSTEM = "postgres_ecommerce"
 SOURCE_SCHEMA = "ecommerce"
@@ -18,13 +33,47 @@ SOURCE_SCHEMA = "ecommerce"
 LINEAGE_PREFIX = "_"
 
 
-@dataclass(frozen=True)
-class TableSpec:
-    """Como se ingesta y se valida una tabla del origen."""
+# ------------------------------------------------------------------ origen ---
 
-    name: str
-    business_key: list[str]
-    """Clave real de negocio. Es la que usa el MERGE de Silver, no la PK tecnica."""
+
+@dataclass(frozen=True)
+class SourceSpec:
+    """De donde sale una tabla. Una subclase por tipo de origen.
+
+    Se modela con subclases y no con un campo `kind` mas un monton de opciones
+    opcionales porque asi **los estados invalidos no se pueden ni escribir**:
+    con un unico dataclass seria posible declarar `kind="jdbc"` sin opciones de
+    JDBC, y eso solo reventaria en ejecucion.
+
+    `kind` es un ClassVar (no un campo) para que siga siendo un string
+    greppable con el que despachar en los jobs, sin poder contradecir a la clase.
+    """
+
+    kind: ClassVar[str] = "?"
+
+    system: str = SOURCE_SYSTEM
+    """Identificador del sistema de origen. Va a la columna de linaje
+    `_source_system`, que es lo que responde "¿de donde salio esta fila?"
+    cuando en el lake hay datos de varios sitios."""
+
+    @property
+    def bronze_namespace(self) -> str:
+        """Carpeta bajo `bronze/` que agrupa las tablas de este origen.
+
+        En JDBC es el esquema de la base de datos. Manteniendo el nombre del
+        origen en la ruta, dos tablas que se llamen igual en sistemas distintos
+        no se pisan.
+        """
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class JdbcSource(SourceSpec):
+    """Tabla leida por JDBC, de forma incremental por watermark."""
+
+    kind: ClassVar[str] = "jdbc"
+
+    schema: str = SOURCE_SCHEMA
 
     watermark_column: str = "updated_at"
     """Columna que usa la extraccion incremental. Debe tener indice en origen."""
@@ -32,6 +81,56 @@ class TableSpec:
     partition_column: str | None = None
     """Columna numerica para paralelizar la lectura JDBC. Sin esto, Spark lee
     la tabla entera con un solo hilo y el job tarda una eternidad."""
+
+    @property
+    def bronze_namespace(self) -> str:
+        return self.schema
+
+
+# ------------------------------------------------------------------ reglas ---
+
+
+@dataclass(frozen=True)
+class TimeSanity:
+    """Dos columnas de tiempo que tienen que guardar un orden entre si.
+
+    Sirve para lo que ninguna regla de una sola columna puede ver: un valor
+    plausible por si mismo pero imposible en relacion con otro. Un `created_at`
+    posterior a su `updated_at` no esta fuera de rango ni es nulo ni incumple
+    ningun patron: simplemente no puede haber pasado.
+    """
+
+    column: str
+    not_after: str
+    """Nombre de la otra columna. `column` no puede ser posterior a esta."""
+
+    tolerance: timedelta = timedelta(0)
+    """Holgura admitida. Dos relojes nunca van exactamente iguales, y sin margen
+    acabas mandando a cuarentena filas correctas."""
+
+    @property
+    def reason(self) -> str:
+        return f"{self.column}_posterior_a_{self.not_after}"
+
+
+@dataclass(frozen=True)
+class TableSpec:
+    """Como se ingesta y se valida una tabla del origen."""
+
+    name: str
+    source: SourceSpec
+    business_key: list[str]
+    """Clave real de negocio. Es la que usa el MERGE de Silver, no la PK tecnica."""
+
+    dedup_order: list[str] = field(default_factory=list)
+    """Columnas que deciden que fila sobrevive al dedup, de mas a menos
+    prioritaria, siempre descendente.
+
+    Se declara en vez de deducirse porque **la respuesta obvia solo existe en
+    JDBC**: alli es la watermark, gana la fila modificada mas recientemente. En
+    un origen append-only no hay ninguna columna que signifique "esta version es
+    posterior a aquella", y elegirla mal borra datos buenos sin dar ni un
+    error."""
 
     # --- normalizacion (Silver) ---
     # Se aplica ANTES de validar, para no mandar a cuarentena una fila cuyo
@@ -46,11 +145,32 @@ class TableSpec:
     # --- validacion (Silver) ---
 
     not_null: list[str] = field(default_factory=list)
+
     non_negative: list[str] = field(default_factory=list)
+    """Caso particular de `ranges` con minimo 0. Se mantiene aparte por ser con
+    diferencia el mas frecuente, y porque `non_negative=["quantity"]` se lee
+    mejor que `ranges={"quantity": (0, None)}`."""
+
+    ranges: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)
+    """{columna: (minimo, maximo)}, ambos inclusive, cualquiera puede ser None.
+
+    Hace falta cuando `non_negative` no vale, y no vale mas veces de las que
+    parece: una devolucion es un importe negativo **correcto**. La regla que
+    protege una tabla es el bug de la de al lado."""
+
+    allowed_values: dict[str, list[str]] = field(default_factory=dict)
+    """{columna: valores admitidos}. Enumerados: estados, divisas, segmentos.
+
+    Un valor nuevo aqui rara vez es un dato sucio. Casi siempre es el origen
+    avisando de que ha cambiado sin decirselo a nadie, que es la forma mas
+    barata de enterarse de una migracion ajena."""
 
     patterns: dict[str, str] = field(default_factory=dict)
     """{columna: regex}. Para lo que la normalizacion no puede arreglar: un
     'ESP' donde se esperaba 'ES' no es un problema de formato, es un dato malo."""
+
+    time_sanity: list[TimeSanity] = field(default_factory=list)
+    """Coherencia entre columnas de tiempo. Ver `TimeSanity`."""
 
     references: dict[str, tuple[str, str]] = field(default_factory=dict)
     """{columna_local: (tabla_padre, columna_padre)} para la integridad referencial."""
@@ -77,7 +197,7 @@ class TableSpec:
 
     @property
     def bronze_path_suffix(self) -> str:
-        return f"{SOURCE_SCHEMA}/{self.name}"
+        return f"{self.source.bronze_namespace}/{self.name}"
 
     @property
     def silver_table(self) -> str:
@@ -91,37 +211,63 @@ class TableSpec:
 EMAIL_PATTERN = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
 ISO_COUNTRY_PATTERN = r"^[A-Z]{2}$"
 
+# Vocabularios del negocio. Viven aqui y no en el generador porque los consumen
+# los dos: `data_generator/seed.py` los importa para producir datos, y Silver
+# los usa para validarlos. Con dos listas separadas, anadir un estado nuevo al
+# generador mandaria a cuarentena datos perfectamente buenos.
+CATEGORIES = ["electronica", "hogar", "moda", "deporte", "libros", "juguetes", "belleza"]
+SEGMENTS = ["bronze", "silver", "gold", "platinum"]
+ORDER_STATUS = ["pending", "paid", "shipped", "delivered", "cancelled", "returned"]
+COUNTRIES = ["ES", "PT", "FR", "IT", "DE", "NL"]
+CURRENCIES = ["EUR"]
+
+# Holgura de las comprobaciones temporales. Postgres escribe created_at y
+# updated_at en el mismo INSERT, pero no en el mismo instante.
+CLOCK_TOLERANCE = timedelta(seconds=1)
+
 TABLES: dict[str, TableSpec] = {
     "customers": TableSpec(
         name="customers",
+        source=JdbcSource(partition_column="customer_id"),
         business_key=["customer_id"],
-        partition_column="customer_id",
+        dedup_order=["updated_at"],
         lower_trim=["email"],
         upper_trim=["country_code"],
         not_null=["customer_id", "email"],
         patterns={"email": EMAIL_PATTERN, "country_code": ISO_COUNTRY_PATTERN},
+        # country_code se queda con el patron y sin lista de valores a proposito:
+        # los paises invalidos que produce el origen ('ESP') ya incumplen el
+        # patron, y anadir la lista solo duplicaria el motivo en la misma fila.
+        allowed_values={"segment": SEGMENTS},
+        time_sanity=[TimeSanity("created_at", "updated_at", CLOCK_TOLERANCE)],
         # Emails y paises mal tecleados: ruido esperable de un formulario.
         quarantine_threshold=0.06,
     ),
     "products": TableSpec(
         name="products",
+        source=JdbcSource(partition_column="product_id"),
         business_key=["product_id"],
-        partition_column="product_id",
+        dedup_order=["updated_at"],
         upper_trim=["sku"],
         lower_trim=["category"],
         not_null=["product_id", "sku"],
         non_negative=["unit_price"],
+        allowed_values={"category": CATEGORIES},
+        time_sanity=[TimeSanity("created_at", "updated_at", CLOCK_TOLERANCE)],
         # El catalogo lo mantiene gente, no un formulario publico: se espera limpio.
         quarantine_threshold=0.03,
     ),
     "orders": TableSpec(
         name="orders",
+        source=JdbcSource(partition_column="order_id"),
         business_key=["order_id"],
-        partition_column="order_id",
+        dedup_order=["updated_at"],
         lower_trim=["status"],
         upper_trim=["currency"],
         not_null=["order_id", "customer_id", "order_date"],
         non_negative=["total_amount"],
+        allowed_values={"status": ORDER_STATUS, "currency": CURRENCIES},
+        time_sanity=[TimeSanity("created_at", "updated_at", CLOCK_TOLERANCE)],
         references={"customer_id": ("customers", "customer_id")},
         # Un pedido mal formado es dinero que no cuadra: menos tolerancia.
         quarantine_threshold=0.05,
@@ -130,10 +276,16 @@ TABLES: dict[str, TableSpec] = {
     ),
     "order_items": TableSpec(
         name="order_items",
+        source=JdbcSource(partition_column="order_item_id"),
         business_key=["order_item_id"],
-        partition_column="order_item_id",
+        dedup_order=["updated_at"],
         not_null=["order_item_id", "order_id", "product_id"],
         non_negative=["quantity", "unit_price", "line_amount"],
+        # Mil unidades de la misma linea no es un pedido: es un error de tecleo
+        # o una prueba de carga que se colo en produccion. El minimo lo cubre
+        # ya `non_negative`, asi que aqui solo hace falta el techo.
+        ranges={"quantity": (None, 1000)},
+        time_sanity=[TimeSanity("created_at", "updated_at", CLOCK_TOLERANCE)],
         references={
             "order_id": ("orders", "order_id"),
             "product_id": ("products", "product_id"),
@@ -182,7 +334,7 @@ class Layout:
         return f"s3://{self.bucket}/silver/_quarantine"
 
     def bronze_table(self, table: str) -> str:
-        return f"{self.bronze}/{SOURCE_SCHEMA}/{table}"
+        return f"{self.bronze}/{get_table(table).bronze_path_suffix}"
 
 
 def catalog_database(layer: str, environment: str = "dev") -> str:

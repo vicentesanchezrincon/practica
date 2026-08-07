@@ -6,13 +6,17 @@ y sirven de red de seguridad cuando anadas tablas nuevas a TABLES.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 
 from common.config import (
     INGESTION_ORDER,
+    LINEAGE_PREFIX,
     QUARANTINE_THRESHOLD,
     TABLES,
     Layout,
+    SourceSpec,
     catalog_database,
     get_table,
 )
@@ -50,6 +54,65 @@ def test_la_clave_de_negocio_esta_entre_los_not_null():
     """Una clave de negocio con NULL rompe el MERGE de Silver en silencio."""
     for spec in TABLES.values():
         assert set(spec.business_key) <= set(spec.not_null)
+
+
+def test_toda_tabla_declara_como_desempatar_el_dedup():
+    """Sin `dedup_order` no hay forma de saber que fila sobrevive cuando una
+    clave aparece repetida, y elegir mal descarta datos buenos en silencio."""
+    for spec in TABLES.values():
+        assert spec.dedup_order, f"{spec.name} no declara dedup_order"
+
+
+def test_las_columnas_de_desempate_no_son_de_linaje():
+    """Ordenar por `_ingested_at` como criterio principal haria que el
+    superviviente dependiera de cuando se ejecuto el job, no de los datos."""
+    for spec in TABLES.values():
+        assert not any(c.startswith(LINEAGE_PREFIX) for c in spec.dedup_order)
+
+
+# --------------------------------------------------------------- origenes ---
+
+
+def test_todo_origen_declara_su_tipo():
+    """`kind` es lo que mira cada job para saber como leer la tabla."""
+    for spec in TABLES.values():
+        assert isinstance(spec.source, SourceSpec)
+        assert spec.source.kind != "?", f"{spec.name} usa SourceSpec en crudo"
+
+
+def test_la_ruta_de_bronze_sale_del_origen_y_no_de_una_constante():
+    """Dos sistemas pueden tener una tabla con el mismo nombre. Si la ruta no
+    lleva el origen, la segunda pisa a la primera sin avisar."""
+    assert get_table("orders").bronze_path_suffix == "ecommerce/orders"
+
+
+def test_un_origen_generico_no_sabe_donde_escribir():
+    """SourceSpec es una base abstracta: quien anada un tipo de origen tiene
+    que decidir su espacio de nombres, no heredar uno por accidente."""
+    with pytest.raises(NotImplementedError):
+        _ = SourceSpec().bronze_namespace
+
+
+def test_los_enumerados_declarados_no_estan_vacios():
+    for spec in TABLES.values():
+        for columna, admitidos in spec.allowed_values.items():
+            assert admitidos, f"{spec.name}.{columna} declara una lista vacia"
+
+
+def test_los_rangos_tienen_al_menos_un_extremo():
+    """Un rango (None, None) no valida nada y se lee como si validara algo."""
+    for spec in TABLES.values():
+        for columna, (minimo, maximo) in spec.ranges.items():
+            assert minimo is not None or maximo is not None, f"{spec.name}.{columna}"
+            if minimo is not None and maximo is not None:
+                assert minimo <= maximo
+
+
+def test_las_comprobaciones_temporales_usan_dos_columnas_distintas():
+    for spec in TABLES.values():
+        for comprobacion in spec.time_sanity:
+            assert comprobacion.column != comprobacion.not_after
+            assert comprobacion.tolerance >= timedelta(0)
 
 
 @pytest.mark.parametrize("nombre", sorted(TABLES))

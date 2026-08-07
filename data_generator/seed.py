@@ -30,13 +30,14 @@ from datetime import UTC, date, datetime, timedelta
 import psycopg
 from faker import Faker
 
+# Los vocabularios del negocio vienen del pipeline, no de aqui. Silver valida
+# contra estas mismas listas: con una copia local, anadir un estado nuevo al
+# generador mandaria a cuarentena datos perfectamente buenos, y el sintoma
+# aparecerian tres capas mas abajo.
+from common.config import CATEGORIES, COUNTRIES, ORDER_STATUS, SEGMENTS
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-7s %(message)s")
 log = logging.getLogger("seed")
-
-CATEGORIES = ["electronica", "hogar", "moda", "deporte", "libros", "juguetes", "belleza"]
-SEGMENTS = ["bronze", "silver", "gold", "platinum"]
-ORDER_STATUS = ["pending", "paid", "shipped", "delivered", "cancelled", "returned"]
-COUNTRIES = ["ES", "PT", "FR", "IT", "DE", "NL"]
 
 
 @dataclass(frozen=True)

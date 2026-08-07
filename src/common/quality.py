@@ -49,6 +49,14 @@ class QualityReport:
 def _rules(spec: TableSpec, df: DataFrame) -> list[tuple[Column, str]]:
     """Pares (condicion_de_fallo, motivo) derivados de la configuracion.
 
+    Seis familias de regla, y ninguna sustituye a las demas:
+
+      * `not_null`       falta el dato
+      * `non_negative`   y `ranges`, el dato esta fuera de lo posible
+      * `allowed_values` el dato no esta en el vocabulario acordado
+      * `patterns`       el dato no tiene la forma acordada
+      * `time_sanity`    el dato es plausible pero contradice a otra columna
+
     Solo se aplican reglas sobre columnas que existan en el DataFrame: asi una
     tabla a la que todavia no le ha llegado una columna nueva no revienta.
     """
@@ -62,6 +70,39 @@ def _rules(spec: TableSpec, df: DataFrame) -> list[tuple[Column, str]]:
     for columna in spec.non_negative:
         if columna in columnas:
             reglas.append((F.col(columna) < 0, f"{columna}_negativo"))
+
+    for columna, (minimo, maximo) in spec.ranges.items():
+        if columna not in columnas:
+            continue
+        # Cada extremo es una regla propia y no una sola con un OR: asi el motivo
+        # dice si el valor se quedo corto o se paso, que es lo primero que
+        # pregunta quien mira la cuarentena.
+        if minimo is not None:
+            reglas.append((F.col(columna) < F.lit(minimo), f"{columna}_bajo_minimo"))
+        if maximo is not None:
+            reglas.append((F.col(columna) > F.lit(maximo), f"{columna}_sobre_maximo"))
+
+    for columna, admitidos in spec.allowed_values.items():
+        if columna in columnas:
+            # isNull fuera, igual que en los patrones: de eso ya se encarga
+            # not_null y no queremos el mismo problema contado dos veces.
+            reglas.append(
+                (
+                    F.col(columna).isNotNull() & ~F.col(columna).isin(admitidos),
+                    f"{columna}_valor_no_admitido",
+                ),
+            )
+
+    for comprobacion in spec.time_sanity:
+        if comprobacion.column in columnas and comprobacion.not_after in columnas:
+            margen = comprobacion.tolerance.total_seconds()
+            reglas.append(
+                (
+                    F.col(comprobacion.column).cast("double")
+                    > F.col(comprobacion.not_after).cast("double") + F.lit(margen),
+                    comprobacion.reason,
+                ),
+            )
 
     for columna, patron in spec.patterns.items():
         if columna in columnas:
