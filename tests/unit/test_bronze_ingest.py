@@ -88,14 +88,18 @@ def test_el_watermark_epoch_se_formatea_como_timestamp_valido():
     assert "+00:00" in texto
 
 
-@pytest.mark.parametrize("tabla", INGESTION_ORDER)
+TABLAS_JDBC = [t for t in INGESTION_ORDER if isinstance(get_table(t).source, JdbcSource)]
+
+
+@pytest.mark.parametrize("tabla", TABLAS_JDBC)
 def test_toda_tabla_ingestable_declara_watermark_y_particion(tabla):
     """Sin columna de particion, Spark lee la tabla con un solo hilo; sin
     columna de watermark no hay incremental posible.
 
-    Ambas cuelgan del origen y no de la tabla: solo significan algo en una
-    lectura JDBC incremental."""
+    Se comprueba **solo sobre los origenes JDBC**, y la lista se deriva en vez
+    de escribirse: ninguna de las dos columnas significa nada en un fichero,
+    donde lo que marca el avance es el registro de ficheros procesados.
+    """
     origen = get_table(tabla).source
-    assert isinstance(origen, JdbcSource)
     assert origen.watermark_column
     assert origen.partition_column, f"{tabla} no puede paralelizar la lectura JDBC"

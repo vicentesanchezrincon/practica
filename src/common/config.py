@@ -106,6 +106,46 @@ class JdbcSource(SourceSpec):
         return self.schema
 
 
+@dataclass(frozen=True)
+class FileSource(SourceSpec):
+    """Ficheros depositados en una zona de aterrizaje.
+
+    Ninguno de los campos de `JdbcSource` significa nada aqui, y esa es
+    exactamente la razon de que el origen sea una jerarquia: no hay watermark
+    —lo que marca el avance es el registro de ficheros ya procesados— ni
+    columna de particion, porque no hay una consulta que trocear.
+
+    Lo que si hay son cosas que en JDBC no existen, empezando por la
+    codificacion: la base de datos entrega texto ya decodificado y un fichero
+    entrega bytes.
+    """
+
+    kind: ClassVar[str] = "fichero"
+
+    namespace: str = "ficheros"
+    landing_prefix: str = ""
+    """Carpeta bajo el bucket donde el proveedor deja los ficheros."""
+
+    encoding: str = "utf-8"
+    """Y no se adivina. Leer latin-1 como UTF-8 **no lanza ninguna excepcion**
+    con la configuracion por defecto: sustituye los bytes que no entiende y
+    sigue. El acento se convierte en un simbolo raro y llega hasta Gold."""
+
+    date_format: str = "%d/%m/%Y"
+    """El formato de fecha del proveedor, no el tuyo.
+
+    Interpretar dd/mm/aaaa como MM/dd/yyyy no falla ningun dia del mes menor o
+    igual que 12: el error parece intermitente y se descarta como "cosa rara"."""
+
+    decimal_comma: bool = False
+    """Si los importes usan coma decimal. `to_double("125,40")` en Spark
+    devuelve NULL sin avisar, y una columna entera de importes se va a cero."""
+
+    @property
+    def bronze_namespace(self) -> str:
+        return self.namespace
+
+
 # ------------------------------------------------------------------ reglas ---
 
 
@@ -261,6 +301,9 @@ EVENT_TYPES = [
 ]
 DEVICES = ["movil", "escritorio", "tablet"]
 
+# Tipos de movimiento de un fichero de liquidacion.
+LIQUIDACION_TIPOS = ["PAGO", "DEVOL", "AJUSTE"]
+
 ANALYTICS_SCHEMA = "analytics"
 
 # Ventana de reproceso de los eventos. Cubre el peor retraso que produce el
@@ -391,9 +434,48 @@ TABLES: dict[str, TableSpec] = {
         # `orders`, y practicamente toda consulta acota un rango de fechas.
         silver_partition="days(event_time)",
     ),
+    # --------------------------------------------- los ficheros del PSP ---
+    # Segundo tipo de origen, y el que de verdad pone a prueba `SourceSpec`:
+    # aqui no hay watermark, ni columna de particion, ni consulta que trocear.
+    "liquidaciones": TableSpec(
+        name="liquidaciones",
+        source=FileSource(
+            system="psp_acme",
+            namespace="psp",
+            landing_prefix="landing/liquidaciones",
+            encoding="latin-1",
+            date_format="%d/%m/%Y",
+            decimal_comma=True,
+        ),
+        # El fichero no trae identificador de linea, asi que la clave se compone
+        # del fichero y el numero de linea dentro de el. Es lo unico estable:
+        # el mismo pedido puede liquidarse dos veces (un pago y su devolucion).
+        business_key=["fichero", "linea"],
+        dedup_order=["_ingested_at"],
+        upper_trim=["tipo", "divisa", "metodo"],
+        not_null=["fichero", "linea", "fecha_operacion", "importe"],
+        # NO va `non_negative` sobre el importe, y es lo importante de esta
+        # tabla: una devolucion es un importe negativo CORRECTO. La regla que
+        # protege `orders` mandaria a cuarentena los datos buenos.
+        # El techo sigue teniendo sentido: un cobro de un millon es un error.
+        ranges={"importe": (-1_000_000.0, 1_000_000.0)},
+        allowed_values={"tipo": LIQUIDACION_TIPOS, "divisa": CURRENCIES},
+        # `order_id` NO esta en not_null: hay cargos del proveedor que no
+        # corresponden a ningun pedido (una penalizacion, un ajuste mensual).
+        references={"order_id": ("orders", "order_id")},
+        quarantine_threshold=0.03,
+        silver_partition="months(fecha_liquidacion)",
+    ),
 }
 
-INGESTION_ORDER = ["customers", "products", "orders", "order_items", "web_events"]
+INGESTION_ORDER = [
+    "customers",
+    "products",
+    "orders",
+    "order_items",
+    "web_events",
+    "liquidaciones",
+]
 """Orden de ingesta. Los padres antes que los hijos, para que la validacion
 de integridad referencial de Silver tenga contra que comparar."""
 
