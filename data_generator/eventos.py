@@ -41,16 +41,14 @@ import random
 import uuid
 from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
-from zoneinfo import ZoneInfo
 
 import psycopg
 
+from common.tiempo import MADRID, hora_ambigua, transiciones_horarias
 from data_generator.seed import connect, copy_rows, fetch_ids
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-7s %(message)s")
 log = logging.getLogger("eventos")
-
-MADRID = ZoneInfo("Europe/Madrid")
 
 DEVICES = ["movil", "escritorio", "tablet"]
 UTM_SOURCES = ["organico", "google_ads", "newsletter", "instagram", "afiliados", "directo"]
@@ -156,7 +154,7 @@ def _hora_realista(dia_inicial: date, dias: int) -> datetime:
     )
     # Hora ambigua (la que se repite al atrasar el reloj): las dos lecturas son
     # instantes UTC reales y distintos, asi que se sortea cual de las dos.
-    if local.utcoffset() != local.replace(fold=1).utcoffset():
+    if hora_ambigua(local):
         local = local.replace(fold=random.randint(0, 1))
     return local.astimezone(UTC)
 
@@ -277,25 +275,6 @@ def _sesion(
                 )
 
     return eventos
-
-
-def transiciones_horarias(desde: date, hasta: date) -> list[tuple[date, str]]:
-    """Los dias del historico en que cambia la hora, y en que sentido.
-
-    Se detectan comparando el desfase UTC al principio y al final del dia en
-    lugar de codificar "el ultimo domingo de marzo": la regla cambia, ya cambio
-    en el pasado y hay una directiva europea para suprimirla. Preguntarselo a
-    la libreria de husos es lo unico que no caduca.
-    """
-    dias: list[tuple[date, str]] = []
-    dia = desde
-    while dia <= hasta:
-        inicio = datetime(dia.year, dia.month, dia.day, 0, 30, tzinfo=MADRID).utcoffset()
-        final = datetime(dia.year, dia.month, dia.day, 23, 30, tzinfo=MADRID).utcoffset()
-        if inicio != final:
-            dias.append((dia, "adelanta" if final > inicio else "atrasa"))
-        dia += timedelta(days=1)
-    return dias
 
 
 def _sesiones_del_cambio_de_hora(

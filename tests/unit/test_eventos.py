@@ -13,19 +13,11 @@ toman mal:
 
 from __future__ import annotations
 
-import sys
 from datetime import UTC, date, datetime, timedelta
-from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from common.config import EVENT_LOOKBACK, INGESTION_ORDER, get_table
+from common.tiempo import MADRID, hora_ambigua, hora_inexistente, transiciones_horarias
 
-# El generador vive fuera de src/ y no es un paquete instalado.
-sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-
-from data_generator.eventos import transiciones_horarias  # noqa: E402
-
-MADRID = ZoneInfo("Europe/Madrid")
 EVENTOS = get_table("web_events")
 
 
@@ -144,6 +136,32 @@ def test_la_hora_que_se_repite_son_dos_instantes_distintos():
     despues = datetime(2025, 10, 26, 2, 30, tzinfo=MADRID, fold=1).astimezone(UTC)
     assert antes != despues
     assert despues - antes == timedelta(hours=1)
+
+
+def test_se_reconoce_la_hora_que_ocurre_dos_veces():
+    ambigua = datetime(2025, 10, 26, 2, 30, tzinfo=MADRID)
+    normal = datetime(2025, 10, 26, 5, 30, tzinfo=MADRID)
+    assert hora_ambigua(ambigua)
+    assert not hora_ambigua(normal)
+
+
+def test_la_hora_que_no_existe_no_se_confunde_con_la_que_se_repite():
+    """Las 02:30 del dia que el reloj se adelanta no ocurren NI UNA vez.
+
+    Son problemas opuestos —uno duplica y el otro borra— y la implementacion
+    evidente los confunde: comparar los desfases de fold=0 y fold=1 da True
+    para los dos, porque `fold` cubre las dos anomalias. Lo que las separa es
+    el signo de la diferencia.
+    """
+    imposible = datetime(2026, 3, 29, 2, 30, tzinfo=MADRID)
+    assert hora_inexistente(imposible)
+    assert not hora_ambigua(imposible)
+
+
+def test_una_hora_corriente_no_es_ni_lo_uno_ni_lo_otro():
+    normal = datetime(2026, 6, 15, 2, 30, tzinfo=MADRID)
+    assert not hora_ambigua(normal)
+    assert not hora_inexistente(normal)
 
 
 def test_en_utc_esa_misma_hora_no_se_repite():
