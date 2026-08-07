@@ -7,6 +7,7 @@ produce datos ligeramente equivocados.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 
 import pytest
@@ -152,6 +153,33 @@ def test_deduplicar_es_idempotente(spark):
     una_vez = deduplicate(df, spec)
     dos_veces = deduplicate(una_vez, spec)
     assert una_vez.collect() == dos_veces.collect()
+
+
+def test_el_criterio_de_desempate_sale_de_la_configuracion(spark):
+    """Antes estaba escrito a fuego: siempre ganaba el `updated_at` mas alto.
+
+    Eso solo vale si el origen actualiza filas. Este test fija que el criterio
+    lo pone la tabla, ordenando por una columna distinta y comprobando que gana
+    otra fila que la que ganaria con la watermark.
+    """
+    df = customers_df(
+        spark,
+        [
+            (1, "viejo@b.com", "ES", "bronze", t(9), t(1)),
+            (1, "nuevo@b.com", "ES", "gold", t(1), t(9)),
+        ],
+    )
+    spec = replace(get_table("customers"), dedup_order=["_ingested_at"])
+    assert deduplicate(df, spec).collect()[0]["email"] == "nuevo@b.com"
+
+
+def test_sin_criterio_declarado_el_dedup_se_niega_a_adivinar(spark):
+    """Fallar aqui es barato y ruidoso. La alternativa —quedarse con una fila
+    cualquiera— descarta datos buenos y no deja rastro."""
+    df = customers_df(spark, [(1, "a@b.com", "ES", "gold", t(1), t(1))])
+    spec = replace(get_table("customers"), dedup_order=[])
+    with pytest.raises(ValueError, match="dedup_order"):
+        deduplicate(df, spec)
 
 
 def test_se_quita_la_particion_de_bronze(spark):

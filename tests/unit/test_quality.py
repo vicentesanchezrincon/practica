@@ -7,6 +7,7 @@ tres cosas fallan en silencio si se rompen.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 
 import pytest
@@ -22,7 +23,7 @@ from pyspark.sql.types import (  # noqa: E402
     TimestampType,
 )
 
-from common.config import get_table  # noqa: E402
+from common.config import ORDER_STATUS, SEGMENTS, get_table  # noqa: E402
 from common.quality import ERRORS_COLUMN, report, split  # noqa: E402
 
 # Esquemas explicitos: Spark no puede inferir el tipo de una columna que solo
@@ -42,6 +43,34 @@ ORDERS = StructType(
         StructField("order_date", TimestampType()),
         StructField("total_amount", DoubleType()),
         StructField("currency", StringType()),
+        StructField("updated_at", TimestampType()),
+    ]
+)
+
+# ORDERS a proposito NO trae status ni created_at: las reglas que dependen de
+# columnas ausentes tienen que callarse, y varios tests de arriba lo comprueban
+# sin saberlo. Para las reglas nuevas hace falta la tabla completa.
+ORDERS_COMPLETO = StructType(
+    [
+        StructField("order_id", LongType()),
+        StructField("customer_id", LongType()),
+        StructField("order_date", TimestampType()),
+        StructField("total_amount", DoubleType()),
+        StructField("currency", StringType()),
+        StructField("status", StringType()),
+        StructField("created_at", TimestampType()),
+        StructField("updated_at", TimestampType()),
+    ]
+)
+ORDER_ITEMS = StructType(
+    [
+        StructField("order_item_id", LongType()),
+        StructField("order_id", LongType()),
+        StructField("product_id", LongType()),
+        StructField("quantity", LongType()),
+        StructField("unit_price", DoubleType()),
+        StructField("line_amount", DoubleType()),
+        StructField("created_at", TimestampType()),
         StructField("updated_at", TimestampType()),
     ]
 )
@@ -200,6 +229,129 @@ def test_no_se_pierde_ninguna_fila(spark):
     )
     validas, cuarentena = split(df, get_table("customers"))
     assert validas.count() + cuarentena.count() == 4
+    assert validas.count() == 1
+
+
+# ----------------------------------------------------------------- rango ---
+# `ranges` existe porque `non_negative` no llega a todo: hay columnas con techo,
+# y hay columnas donde un negativo es correcto (una devolucion).
+
+
+def test_un_valor_por_encima_del_maximo_va_a_cuarentena(spark):
+    """order_items pone techo de 1000 a quantity: mil unidades de la misma
+    linea no es un pedido, es un error de tecleo."""
+    df = spark.createDataFrame([(1, 10, 20, 5000, 2.0, 10.0, T, T)], ORDER_ITEMS)
+    validas, cuarentena = split(df, get_table("order_items"))
+    assert validas.count() == 0
+    assert "quantity_sobre_maximo" in motivos(cuarentena)
+
+
+def test_un_valor_justo_en_el_maximo_es_valido(spark):
+    """Los extremos son inclusive. Si no lo fueran, el limite documentado y el
+    aplicado se diferenciarian en uno y nadie lo notaria hasta el borde."""
+    df = spark.createDataFrame([(1, 10, 20, 1000, 2.0, 10.0, T, T)], ORDER_ITEMS)
+    validas, _ = split(df, get_table("order_items"))
+    assert validas.count() == 1
+
+
+def test_el_motivo_distingue_pasarse_de_quedarse_corto(spark):
+    """Cada extremo es su propia regla, no un OR. Quien mira la cuarentena
+    quiere saber hacia que lado se fue el valor sin abrir la fila."""
+    spec = replace(get_table("order_items"), ranges={"quantity": (2, 10)})
+    df = spark.createDataFrame([(1, 10, 20, 1, 2.0, 10.0, T, T)], ORDER_ITEMS)
+    _, cuarentena = split(df, spec)
+    assert "quantity_bajo_minimo" in motivos(cuarentena)
+    assert "quantity_sobre_maximo" not in motivos(cuarentena)
+
+
+def test_un_rango_sin_minimo_no_rechaza_negativos(spark):
+    """El caso de la liquidacion: una devolucion es un importe negativo bueno.
+    Con (None, x) el suelo simplemente no existe."""
+    spec = replace(get_table("order_items"), non_negative=[], ranges={"line_amount": (None, 999.0)})
+    df = spark.createDataFrame([(1, 10, 20, 1, 2.0, -45.0, T, T)], ORDER_ITEMS)
+    validas, _ = split(df, spec)
+    assert validas.count() == 1
+
+
+# ------------------------------------------------------------ enumerados ---
+
+
+def test_un_valor_fuera_del_vocabulario_va_a_cuarentena(spark):
+    """No suele ser un dato sucio: es el origen avisando de que ha cambiado."""
+    df = spark.createDataFrame([(1, 7, T, 10.0, "EUR", "devuelto_parcial", T, T)], ORDERS_COMPLETO)
+    validas, cuarentena = split(df, get_table("orders"))
+    assert validas.count() == 0
+    assert "status_valor_no_admitido" in motivos(cuarentena)
+
+
+def test_los_valores_del_vocabulario_pasan(spark):
+    df = spark.createDataFrame([(1, 7, T, 10.0, "EUR", "shipped", T, T)], ORDERS_COMPLETO)
+    validas, cuarentena = split(df, get_table("orders"))
+    assert cuarentena.count() == 0
+    assert validas.count() == 1
+
+
+def test_un_enumerado_nulo_no_duplica_el_motivo(spark):
+    """Mismo criterio que en los patrones: de los nulos ya se encarga not_null.
+    Reportar el mismo problema dos veces hace ilegible la cuarentena."""
+    spec = replace(get_table("orders"), not_null=["order_id", "status"])
+    df = spark.createDataFrame([(1, 7, T, 10.0, "EUR", None, T, T)], ORDERS_COMPLETO)
+    _, cuarentena = split(df, spec)
+    assert motivos(cuarentena) == {"status_nulo"}
+
+
+def test_el_vocabulario_declarado_es_el_que_usa_el_generador():
+    """La regla mas barata de romper: anadir un estado al generador y olvidarse
+    de la lista de validacion. Silver mandaria a cuarentena datos buenos."""
+    assert set(get_table("orders").allowed_values["status"]) == set(ORDER_STATUS)
+    assert set(get_table("customers").allowed_values["segment"]) == set(SEGMENTS)
+
+
+# ------------------------------------------------- coherencia de tiempos ---
+# Lo que ninguna regla de una sola columna puede ver: un valor plausible por si
+# mismo que contradice a otro.
+
+
+def test_un_created_at_posterior_al_updated_at_va_a_cuarentena(spark):
+    creado = datetime(2026, 3, 15, 12, 0, 30)
+    actualizado = datetime(2026, 3, 15, 12, 0, 0)
+    df = spark.createDataFrame(
+        [(1, 7, T, 10.0, "EUR", "paid", creado, actualizado)], ORDERS_COMPLETO
+    )
+    validas, cuarentena = split(df, get_table("orders"))
+    assert validas.count() == 0
+    assert "created_at_posterior_a_updated_at" in motivos(cuarentena)
+
+
+def test_la_tolerancia_absuelve_una_desviacion_minima(spark):
+    """Dos relojes nunca van iguales. Sin margen, la regla manda a cuarentena
+    filas correctas y acaba desactivada por inutil, que es lo peor que le puede
+    pasar a una regla de calidad."""
+    creado = datetime(2026, 3, 15, 12, 0, 0, 500_000)
+    actualizado = datetime(2026, 3, 15, 12, 0, 0)
+    df = spark.createDataFrame(
+        [(1, 7, T, 10.0, "EUR", "paid", creado, actualizado)], ORDERS_COMPLETO
+    )
+    validas, _ = split(df, get_table("orders"))
+    assert validas.count() == 1
+
+
+def test_el_orden_normal_de_los_tiempos_pasa(spark):
+    creado = datetime(2026, 3, 15, 12, 0, 0)
+    actualizado = datetime(2026, 3, 16, 9, 30, 0)
+    df = spark.createDataFrame(
+        [(1, 7, T, 10.0, "EUR", "paid", creado, actualizado)], ORDERS_COMPLETO
+    )
+    validas, cuarentena = split(df, get_table("orders"))
+    assert cuarentena.count() == 0
+    assert validas.count() == 1
+
+
+def test_sin_una_de_las_dos_columnas_la_regla_no_se_aplica(spark):
+    """ORDERS no trae created_at. Una regla que necesita dos columnas y solo
+    encuentra una tiene que callarse, no reventar el job."""
+    df = spark.createDataFrame([(1, 7, T, 10.0, "EUR", T)], ORDERS)
+    validas, _ = split(df, get_table("orders"))
     assert validas.count() == 1
 
 

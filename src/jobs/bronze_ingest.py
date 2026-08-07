@@ -28,7 +28,7 @@ from awsglue.utils import getResolvedOptions
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
-from common.config import INGESTION_ORDER, SOURCE_SCHEMA, SOURCE_SYSTEM, get_table
+from common.config import INGESTION_ORDER, SOURCE_SYSTEM, get_table
 from common.jdbc import connection_options, credentials, scalar_query
 from common.watermark import WatermarkStore, format
 
@@ -49,31 +49,33 @@ def pending_stats(spark, options, spec, watermark) -> dict:
     Se pregunta antes de leer para poder paralelizar bien: sin lowerBound y
     upperBound, Spark no puede repartir la lectura entre varios hilos.
     """
+    origen = spec.source
     sql = f"""
         SELECT count(*) AS n,
-               min({spec.partition_column}) AS lo,
-               max({spec.partition_column}) AS hi,
-               max({spec.watermark_column}) AS max_wm
-        FROM {SOURCE_SCHEMA}.{spec.name}
-        WHERE {spec.watermark_column} > TIMESTAMP '{format(watermark)}'
+               min({origen.partition_column}) AS lo,
+               max({origen.partition_column}) AS hi,
+               max({origen.watermark_column}) AS max_wm
+        FROM {origen.schema}.{spec.name}
+        WHERE {origen.watermark_column} > TIMESTAMP '{format(watermark)}'
     """
     return scalar_query(spark, options, sql)
 
 
 def read_incremental(spark, options, spec, watermark, stats) -> DataFrame:
     """Lee del origen solo lo que cambio desde el watermark."""
+    origen = spec.source
     subquery = f"""
-        (SELECT * FROM {SOURCE_SCHEMA}.{spec.name}
-         WHERE {spec.watermark_column} > TIMESTAMP '{format(watermark)}') AS t
+        (SELECT * FROM {origen.schema}.{spec.name}
+         WHERE {origen.watermark_column} > TIMESTAMP '{format(watermark)}') AS t
     """
 
     reader = spark.read.format("jdbc").options(**options).option("dbtable", subquery)
 
     n_particiones = min(MAX_PARTITIONS, max(1, stats["n"] // ROWS_PER_PARTITION))
-    if n_particiones > 1 and spec.partition_column and stats["lo"] is not None:
+    if n_particiones > 1 and origen.partition_column and stats["lo"] is not None:
         # Spark trocea el rango [lo, hi] y lanza una consulta por trozo.
         reader = (
-            reader.option("partitionColumn", spec.partition_column)
+            reader.option("partitionColumn", origen.partition_column)
             .option("lowerBound", str(stats["lo"]))
             .option("upperBound", str(stats["hi"]))
             .option("numPartitions", str(n_particiones))
@@ -82,15 +84,19 @@ def read_incremental(spark, options, spec, watermark, stats) -> DataFrame:
     return reader.load()
 
 
-def add_lineage(df: DataFrame, batch_id: str, ingested_at: datetime) -> DataFrame:
+def add_lineage(
+    df: DataFrame, batch_id: str, ingested_at: datetime, system: str = SOURCE_SYSTEM
+) -> DataFrame:
     """Anade el rastro de por donde paso la fila.
 
     Cuando dentro de seis meses alguien pregunte "¿de donde sale este dato?",
-    estas tres columnas son la respuesta.
+    estas cuatro columnas son la respuesta. `system` sale del origen y no de una
+    constante del modulo: en cuanto el lake tiene datos de dos sitios, saber de
+    cual vino cada fila deja de ser una curiosidad.
     """
     return (
         df.withColumn("_ingested_at", F.lit(ingested_at).cast("timestamp"))
-        .withColumn("_source_system", F.lit(SOURCE_SYSTEM))
+        .withColumn("_source_system", F.lit(system))
         .withColumn("_batch_id", F.lit(batch_id))
         .withColumn("ingestion_date", F.lit(ingested_at.date().isoformat()))
     )
@@ -109,9 +115,9 @@ def ingest_table(spark, options, store, table, bucket, batch_id, ingested_at) ->
         return {"tabla": table, "filas": 0, "watermark": format(watermark)}
 
     df = read_incremental(spark, options, spec, watermark, stats)
-    df = add_lineage(df, batch_id, ingested_at)
+    df = add_lineage(df, batch_id, ingested_at, spec.source.system)
 
-    destino = f"s3://{bucket}/bronze/{SOURCE_SCHEMA}/{spec.name}"
+    destino = f"s3://{bucket}/bronze/{spec.bronze_path_suffix}"
     # append y no overwrite: Bronze es un registro historico. Si un reintento
     # vuelve a traer las mismas filas, se duplican aqui a proposito y Silver las
     # deduplica. Perder filas seria mucho peor que repetirlas.

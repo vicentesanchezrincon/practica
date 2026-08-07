@@ -22,6 +22,7 @@ segundo tipo de origen la costura salta a la vista.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import ClassVar
 
 SOURCE_SYSTEM = "postgres_ecommerce"
@@ -90,6 +91,29 @@ class JdbcSource(SourceSpec):
 
 
 @dataclass(frozen=True)
+class TimeSanity:
+    """Dos columnas de tiempo que tienen que guardar un orden entre si.
+
+    Sirve para lo que ninguna regla de una sola columna puede ver: un valor
+    plausible por si mismo pero imposible en relacion con otro. Un `created_at`
+    posterior a su `updated_at` no esta fuera de rango ni es nulo ni incumple
+    ningun patron: simplemente no puede haber pasado.
+    """
+
+    column: str
+    not_after: str
+    """Nombre de la otra columna. `column` no puede ser posterior a esta."""
+
+    tolerance: timedelta = timedelta(0)
+    """Holgura admitida. Dos relojes nunca van exactamente iguales, y sin margen
+    acabas mandando a cuarentena filas correctas."""
+
+    @property
+    def reason(self) -> str:
+        return f"{self.column}_posterior_a_{self.not_after}"
+
+
+@dataclass(frozen=True)
 class TableSpec:
     """Como se ingesta y se valida una tabla del origen."""
 
@@ -97,6 +121,16 @@ class TableSpec:
     source: SourceSpec
     business_key: list[str]
     """Clave real de negocio. Es la que usa el MERGE de Silver, no la PK tecnica."""
+
+    dedup_order: list[str] = field(default_factory=list)
+    """Columnas que deciden que fila sobrevive al dedup, de mas a menos
+    prioritaria, siempre descendente.
+
+    Se declara en vez de deducirse porque **la respuesta obvia solo existe en
+    JDBC**: alli es la watermark, gana la fila modificada mas recientemente. En
+    un origen append-only no hay ninguna columna que signifique "esta version es
+    posterior a aquella", y elegirla mal borra datos buenos sin dar ni un
+    error."""
 
     # --- normalizacion (Silver) ---
     # Se aplica ANTES de validar, para no mandar a cuarentena una fila cuyo
@@ -111,11 +145,32 @@ class TableSpec:
     # --- validacion (Silver) ---
 
     not_null: list[str] = field(default_factory=list)
+
     non_negative: list[str] = field(default_factory=list)
+    """Caso particular de `ranges` con minimo 0. Se mantiene aparte por ser con
+    diferencia el mas frecuente, y porque `non_negative=["quantity"]` se lee
+    mejor que `ranges={"quantity": (0, None)}`."""
+
+    ranges: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)
+    """{columna: (minimo, maximo)}, ambos inclusive, cualquiera puede ser None.
+
+    Hace falta cuando `non_negative` no vale, y no vale mas veces de las que
+    parece: una devolucion es un importe negativo **correcto**. La regla que
+    protege una tabla es el bug de la de al lado."""
+
+    allowed_values: dict[str, list[str]] = field(default_factory=dict)
+    """{columna: valores admitidos}. Enumerados: estados, divisas, segmentos.
+
+    Un valor nuevo aqui rara vez es un dato sucio. Casi siempre es el origen
+    avisando de que ha cambiado sin decirselo a nadie, que es la forma mas
+    barata de enterarse de una migracion ajena."""
 
     patterns: dict[str, str] = field(default_factory=dict)
     """{columna: regex}. Para lo que la normalizacion no puede arreglar: un
     'ESP' donde se esperaba 'ES' no es un problema de formato, es un dato malo."""
+
+    time_sanity: list[TimeSanity] = field(default_factory=list)
+    """Coherencia entre columnas de tiempo. Ver `TimeSanity`."""
 
     references: dict[str, tuple[str, str]] = field(default_factory=dict)
     """{columna_local: (tabla_padre, columna_padre)} para la integridad referencial."""
@@ -140,21 +195,6 @@ class TableSpec:
     resuelve solo que particiones leer. En Hive tendrias que filtrar por la
     columna de particion a mano, y todo el mundo se olvida."""
 
-    # --- puentes de compatibilidad, se retiran al final de la Fase 10 ---
-    # Existen para que este commit sea un refactor puro: reestructura los datos
-    # sin tocar ni una linea de los jobs ni de los tests. Si algo se rompe al
-    # quitarlos, se sabe que lo rompio quitar el puente y no la reestructura.
-
-    @property
-    def watermark_column(self) -> str:
-        """OBSOLETO: usar `spec.source.watermark_column`. Solo existe en JDBC."""
-        return self.source.watermark_column  # type: ignore[attr-defined]
-
-    @property
-    def partition_column(self) -> str | None:
-        """OBSOLETO: usar `spec.source.partition_column`. Solo existe en JDBC."""
-        return self.source.partition_column  # type: ignore[attr-defined]
-
     @property
     def bronze_path_suffix(self) -> str:
         return f"{self.source.bronze_namespace}/{self.name}"
@@ -171,15 +211,35 @@ class TableSpec:
 EMAIL_PATTERN = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
 ISO_COUNTRY_PATTERN = r"^[A-Z]{2}$"
 
+# Vocabularios del negocio. Viven aqui y no en el generador porque los consumen
+# los dos: `data_generator/seed.py` los importa para producir datos, y Silver
+# los usa para validarlos. Con dos listas separadas, anadir un estado nuevo al
+# generador mandaria a cuarentena datos perfectamente buenos.
+CATEGORIES = ["electronica", "hogar", "moda", "deporte", "libros", "juguetes", "belleza"]
+SEGMENTS = ["bronze", "silver", "gold", "platinum"]
+ORDER_STATUS = ["pending", "paid", "shipped", "delivered", "cancelled", "returned"]
+COUNTRIES = ["ES", "PT", "FR", "IT", "DE", "NL"]
+CURRENCIES = ["EUR"]
+
+# Holgura de las comprobaciones temporales. Postgres escribe created_at y
+# updated_at en el mismo INSERT, pero no en el mismo instante.
+CLOCK_TOLERANCE = timedelta(seconds=1)
+
 TABLES: dict[str, TableSpec] = {
     "customers": TableSpec(
         name="customers",
         source=JdbcSource(partition_column="customer_id"),
         business_key=["customer_id"],
+        dedup_order=["updated_at"],
         lower_trim=["email"],
         upper_trim=["country_code"],
         not_null=["customer_id", "email"],
         patterns={"email": EMAIL_PATTERN, "country_code": ISO_COUNTRY_PATTERN},
+        # country_code se queda con el patron y sin lista de valores a proposito:
+        # los paises invalidos que produce el origen ('ESP') ya incumplen el
+        # patron, y anadir la lista solo duplicaria el motivo en la misma fila.
+        allowed_values={"segment": SEGMENTS},
+        time_sanity=[TimeSanity("created_at", "updated_at", CLOCK_TOLERANCE)],
         # Emails y paises mal tecleados: ruido esperable de un formulario.
         quarantine_threshold=0.06,
     ),
@@ -187,10 +247,13 @@ TABLES: dict[str, TableSpec] = {
         name="products",
         source=JdbcSource(partition_column="product_id"),
         business_key=["product_id"],
+        dedup_order=["updated_at"],
         upper_trim=["sku"],
         lower_trim=["category"],
         not_null=["product_id", "sku"],
         non_negative=["unit_price"],
+        allowed_values={"category": CATEGORIES},
+        time_sanity=[TimeSanity("created_at", "updated_at", CLOCK_TOLERANCE)],
         # El catalogo lo mantiene gente, no un formulario publico: se espera limpio.
         quarantine_threshold=0.03,
     ),
@@ -198,10 +261,13 @@ TABLES: dict[str, TableSpec] = {
         name="orders",
         source=JdbcSource(partition_column="order_id"),
         business_key=["order_id"],
+        dedup_order=["updated_at"],
         lower_trim=["status"],
         upper_trim=["currency"],
         not_null=["order_id", "customer_id", "order_date"],
         non_negative=["total_amount"],
+        allowed_values={"status": ORDER_STATUS, "currency": CURRENCIES},
+        time_sanity=[TimeSanity("created_at", "updated_at", CLOCK_TOLERANCE)],
         references={"customer_id": ("customers", "customer_id")},
         # Un pedido mal formado es dinero que no cuadra: menos tolerancia.
         quarantine_threshold=0.05,
@@ -212,8 +278,14 @@ TABLES: dict[str, TableSpec] = {
         name="order_items",
         source=JdbcSource(partition_column="order_item_id"),
         business_key=["order_item_id"],
+        dedup_order=["updated_at"],
         not_null=["order_item_id", "order_id", "product_id"],
         non_negative=["quantity", "unit_price", "line_amount"],
+        # Mil unidades de la misma linea no es un pedido: es un error de tecleo
+        # o una prueba de carga que se colo en produccion. El minimo lo cubre
+        # ya `non_negative`, asi que aqui solo hace falta el techo.
+        ranges={"quantity": (None, 1000)},
+        time_sanity=[TimeSanity("created_at", "updated_at", CLOCK_TOLERANCE)],
         references={
             "order_id": ("orders", "order_id"),
             "product_id": ("products", "product_id"),

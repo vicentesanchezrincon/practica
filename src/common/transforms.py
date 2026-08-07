@@ -51,13 +51,26 @@ def deduplicate(df: DataFrame, spec: TableSpec) -> DataFrame:
          aparecen dos veces, y si una fila se modifico varias veces entre dos
          ingestas, hay varias versiones de la misma clave.
 
-    Se ordena por la columna de watermark descendente, y se desempata por
-    `_ingested_at`: si dos filas tienen el mismo `updated_at` (duplicado exacto
-    del origen), nos quedamos con la que entro mas tarde. Sin ese desempate el
-    resultado dependeria del orden en que Spark leyera los ficheros, y el job
-    dejaria de ser determinista.
+    Se ordena por `spec.dedup_order` descendente, y se desempata por
+    `_ingested_at`: si dos filas empatan en todo (duplicado exacto del origen),
+    nos quedamos con la que entro mas tarde. Sin ese desempate el resultado
+    dependeria del orden en que Spark leyera los ficheros, y el job dejaria de
+    ser determinista.
+
+    **El criterio se declara por tabla y no se deduce.** Con origenes JDBC la
+    respuesta parecia obvia —gana el `updated_at` mas alto— hasta el punto de
+    estar escrita a fuego aqui. Pero eso solo vale si el origen actualiza filas.
+    En uno append-only no hay ninguna columna que signifique "esta version
+    sustituye a aquella", y elegir la equivocada no da error: descarta datos
+    buenos en silencio.
     """
-    orden = [F.col(spec.watermark_column).desc()]
+    if not spec.dedup_order:
+        raise ValueError(
+            f"{spec.name} no declara dedup_order: no hay forma de saber que fila "
+            f"debe sobrevivir cuando una clave de negocio aparece repetida."
+        )
+
+    orden = [F.col(columna).desc() for columna in spec.dedup_order]
     if f"{LINEAGE_PREFIX}ingested_at" in df.columns:
         orden.append(F.col(f"{LINEAGE_PREFIX}ingested_at").desc())
 
