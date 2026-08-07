@@ -614,6 +614,46 @@ cuesta ~0,05 USD/hora, y un merge no debería poder resucitarla sin que lo pidas
 
 ---
 
+## Las fuentes de datos
+
+Tres orígenes, y **cada uno rompe suposiciones distintas**. Esa es la razón de que estén: un pipeline que solo conoce un tipo de origen confunde suposiciones con decisiones.
+
+| Fuente | Tecnología | Lo que rompe |
+|---|---|---|
+| `ecommerce.*` | Postgres, JDBC incremental | — (el caso base) |
+| `analytics.web_events` | **TimescaleDB** (*hypertable*) | No hay `updated_at`, ni clave secuencial; hay dos tiempos; los nulos son legítimos |
+| `landing/liquidaciones/*.txt` | Ficheros multi-registro, latin-1 | No es una tabla; la unidad es el fichero, no la fila; no hay watermark |
+
+Las dos últimas son las tecnologías características del **sector energético** —un *historian* y un fichero de intercambio regulado— transportando datos de e-commerce.
+
+### La serie temporal
+
+Un *historian* (PI System, InfluxDB, TimescaleDB, Timestream) guarda una medida por sensor y por instante, para siempre, y no la actualiza jamás. El flujo de eventos de una tienda web tiene la misma forma.
+
+- **Hay dos tiempos** y elegir mal es el bug: con `event_time` como watermark, un evento de ayer que llega hoy nace por detrás de la marca y **no se lee nunca**. Se usa `received_at` más una ventana de reproceso de 48h.
+- **No hay `PRIMARY KEY`** sobre `event_id`, deliberadamente: con ella, el reenvío fallaría en el `INSERT` y el problema quedaría resuelto en el origen, sin practicar.
+- **El cambio de hora.** La hora local 02:00 del 26/10/2025 existe dos veces, y son instantes separados por una hora real. Deduplicar por hora local se comería la mitad, sin error.
+
+**RDS no ofrece la extensión `timescaledb`** en ninguna versión, ni Aurora tampoco. El DDL lo detecta y cae a tabla plana con índices BRIN; la tabla se llama igual y los jobs no se enteran.
+
+### Los ficheros
+
+```
+C;LIQ;20260315;001;PSP_ACME
+D;14/03/2026;ORD-000481219;PAGO;125,40;2,81;EUR;VISA;Compra online
+P;000482;123456,78;2765,43
+```
+
+Cinco fallos que **no dan ningún error**: encoding latin-1 leído como UTF-8, fecha `dd/mm/aaaa` leída como `MM/dd/yyyy` (que no falla ningún día ≤ 12), fichero truncado, reenvío con otro nombre, y hueco en la secuencia.
+
+La **cuarentena es de lote**: un fichero cuyo pie no cuadra va entero, con el original byte a byte. Media liquidación no es medio dato bueno. La idempotencia se apoya en el **hash del contenido**, no en el nombre.
+
+### La conciliación
+
+`agg_conciliacion_diaria` es la única métrica que cruza **dos orígenes distintos**, y por tanto la única capaz de detectar un fallo que ninguno ve por separado: cada fuente sigue siendo internamente coherente aunque falte un fichero entero.
+
+Se concilia solo el **periodo cubierto** por el proveedor. Sin ese recorte, cada día anterior al primer fichero sale descuadrado al 100% — medido: 367 de 368 días. Ese es el modo de fallo de casi toda alarma de calidad: no que no detecte, sino que detecte tanto que deje de mirarse.
+
 ## Documentación
 
 Dos documentos, con propósitos distintos, escritos en Markdown y generados a PDF:
@@ -791,6 +831,10 @@ gh pr create --base develop
 - [x] **Fase 7** — `feature/step-functions`: orquestación y gate de calidad
 - [x] **Fase 8** — `feature/ci-cd`: GitHub Actions con OIDC
 - [x] **Fase 9** — `release/1.0.0` y ejercicio de hotfix
+- [x] **Fase 10** — `feature/source-spec`: separar cómo se obtiene una tabla de cómo se valida
+- [x] **Fase 11** — `feature/timescale-events`: serie temporal en TimescaleDB
+- [x] **Fase 12** — `feature/landing-files`: zona de aterrizaje y ficheros regulados
+- [x] **Fase 13** — `feature/gold-conciliacion`: embudo, conciliación y estado `Parallel`
 
 El histórico de versiones está en [CHANGELOG.md](CHANGELOG.md).
 

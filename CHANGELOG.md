@@ -10,6 +10,44 @@ mal desde la 1.0.0 y hay que reconstruir Gold» es una entrada de changelog.
 
 ## [No publicado]
 
+### Añadido
+
+- **Dos fuentes de datos de naturaleza distinta**, con las tecnologías
+  características del sector energético transportando datos de e-commerce:
+  - `analytics.web_events`, una serie temporal en **TimescaleDB** (*hypertable*).
+    Sin `updated_at`, con clave UUID, dos marcas de tiempo, entrega *at-least-once*
+    y nulos legítimos. Incluye las dos transiciones de horario de verano.
+  - `landing/liquidaciones/`, **ficheros de intercambio regulados**: multi-registro,
+    latin-1, coma decimal y pie de control.
+- `web_sessions` y `fct_sesion`: la visita se **deriva del tiempo**, porque el
+  identificador de sesión del cliente vive en una cookie y no delimita una visita.
+- `agg_conciliacion_diaria`: la primera comprobación que cruza **dos orígenes**.
+  Es la única capaz de detectar un fichero que falta, porque cada fuente por
+  separado sigue siendo coherente.
+- Tres familias de regla de calidad: `ranges`, `allowed_values` y `time_sanity`.
+- Estado `Parallel` en la máquina de estados: las dos ingestas no comparten nada.
+
+### Cambiado
+
+- `TableSpec` se separa en **cómo se obtiene** una tabla (`SourceSpec` y sus
+  subclases) y **cómo se valida**. El refactor no cambió comportamiento: los 169
+  tests pasaron sin modificar ninguno.
+- El criterio de deduplicación se declara por tabla (`dedup_order`, `dedup_keep`)
+  en vez de estar escrito a fuego.
+
+### Corregido
+
+- **La siembra invalida los watermarks.** Tras un `TRUNCATE`, las marcas
+  describían datos que ya no existían y la extracción incremental daba los nuevos
+  por vistos. Bronze informaba de «sin cambios» y el pipeline corría sobre datos
+  viejos sin que nada fallara.
+- `stringtype=unspecified` en la conexión JDBC: Spark no tiene tipo UUID y el
+  driver de Postgres se negaba a convertir el texto.
+- Los consumidores del registro declaran con qué tipo de origen saben tratar.
+  Recorrer `INGESTION_ORDER` entero reventaba en tres jobs distintos.
+- El umbral de cuarentena de `web_events` sube de 4% a 6%: la medición real dio
+  4,00% exacto, que es suerte y no calibración.
+
 ## [1.0.1] — 2026-08-06
 
 ### Corregido

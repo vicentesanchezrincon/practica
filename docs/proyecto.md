@@ -881,7 +881,353 @@ propaganda.
 
 ---
 
-# 13. Calidad: tests, linting y pre-commit
+# 13. La ampliación: tres orígenes en vez de uno
+
+Hasta la Fase 9 el pipeline sabía hacer una cosa muy bien: leer una tabla
+relacional con `updated_at`, clave primaria secuencial y una fila por entidad.
+Los cuatro orígenes eran ese mismo caso repetido cuatro veces, y esa uniformidad
+escondía cuánto del diseño eran **suposiciones y no decisiones**.
+
+La ampliación mete dos fuentes que rompen esas suposiciones a propósito. El
+dominio sigue siendo el mismo e-commerce: lo que cambia es **cómo llegan los
+datos**, usando las dos tecnologías características del sector energético.
+
+| Fuente | Tecnología del sector | Qué clase de problema trae |
+|---|---|---|
+| `analytics.web_events` | *Historian* / TSDB (PI System, InfluxDB, **TimescaleDB**) | Un origen demasiado rápido y demasiado grande |
+| `landing/liquidaciones/` | Fichero de intercambio regulado por SFTP | Un origen que **ni siquiera es una tabla** |
+
+Son las dos mitades del espacio de problemas que el proyecto no había tocado.
+Todo lo demás del catálogo del sector —SCADA en tiempo real, API del mercado,
+meteorología— es una variación sobre una de las dos.
+
+## 13.1 Por qué el refactor va primero
+
+`TableSpec` mezclaba dos cosas que no tienen nada que ver:
+
+- `watermark_column` y `partition_column`, que son conceptos de **una lectura
+  JDBC incremental** y no significan nada en un fichero;
+- las reglas de calidad, que valen para **cualquier origen**, porque un email
+  mal escrito lo está viniera de donde viniera.
+
+Se separan con `SourceSpec` y una subclase por tipo. Con subclases y no con un
+`kind` más un montón de opciones opcionales, porque así **los estados inválidos
+no se pueden ni escribir**: con el campo suelto sería posible declarar
+`kind="jdbc"` sin opciones de JDBC, y eso solo reventaría en ejecución.
+
+El commit del refactor se hizo y se comprobó como refactor puro: **solo cambia
+`config.py`, y los 169 tests pasan sin modificar ninguno**. Para que eso fuera
+posible, las dos propiedades siguieron existiendo un commit más como puentes que
+delegan en el origen. Separar la reestructura de la migración de las llamadas es
+lo que permite saber cuál de las dos rompió algo.
+
+!!! clave "La prueba de que el refactor valía"
+    Añadir `web_events` fue **añadir una entrada a `TABLES`**, y los 22 tests de
+    invariantes se le aplicaron solos. Añadir `liquidaciones` hizo saltar dos de
+    esos invariantes, que era exactamente su trabajo: avisaron de que un origen
+    de ficheros no cumple reglas escritas pensando en JDBC.
+
+## 13.2 Tres familias de regla que faltaban
+
+Las tres estrenaron usuarios entre las tablas que ya existían, así que no son
+código en barbecho esperando a la fuente nueva: tapan huecos que el pipeline
+tenía ese mismo día.
+
+`ranges`
+:   `non_negative` no llega a todo. Hay columnas con techo, y columnas donde un
+    negativo es **correcto**: una devolución. La regla que protege una tabla es
+    el bug de la de al lado.
+
+`allowed_values`
+:   Los enumerados no se validaban: `status`, `currency`, `segment` y `category`
+    entraban en Silver con cualquier cosa. Un valor fuera del vocabulario rara
+    vez es un dato sucio; casi siempre es el origen avisando de que ha cambiado
+    sin decírselo a nadie.
+
+`time_sanity`
+:   Lo que ninguna regla de una sola columna puede ver. Un `created_at`
+    posterior a su `updated_at` no es nulo, ni negativo, ni incumple ningún
+    patrón: simplemente no puede haber pasado.
+
+Y `dedup_order` deja de estar escrito a fuego. Ordenar siempre por la watermark
+solo vale si el origen actualiza filas; en uno *append-only* no hay ninguna
+columna que signifique «esta versión sustituye a aquella», y elegir mal no da
+error: **descarta datos buenos en silencio**.
+
+---
+
+# 14. La serie temporal: eventos de la tienda web
+
+Un *historian* guarda una medida por sensor y por instante, para siempre, y no
+la actualiza jamás. Es la base de datos que define al sector energético. El
+flujo de eventos de una web tiene exactamente esa forma, así que sirve para
+practicar los mismos problemas con datos que ya entendemos.
+
+## 14.1 Las siete suposiciones que se caen
+
+1. **No hay `updated_at`.** Una fila nunca se modifica. Hay que elegir watermark
+   entre la hora del hecho y la de llegada, y **elegir mal es el bug**: con
+   `event_time`, un evento de ayer que llega hoy nace ya por detrás de la marca
+   y no se lee nunca. Se usa `received_at`.
+2. **Datos que llegan tarde.** Un móvil sin cobertura sincroniza horas después.
+   Obliga a una ventana de reproceso de 48h que retrocede el watermark en cada
+   pasada. El precio son duplicados en Bronze, y es el precio correcto: releer
+   cuesta segundos y perder datos cuesta una auditoría.
+3. **Entrega *at-least-once*.** El mismo `event_id` llega repetido.
+   Deliberadamente **no hay `PRIMARY KEY`**: con ella, el reenvío fallaría en el
+   `INSERT` y el problema quedaría resuelto en el origen, sin practicar.
+4. **No hay clave secuencial.** El id es un UUID, así que no hay rango numérico
+   que trocear: la lectura se paraleliza por *timestamp*.
+5. **Nulos legítimos.** Dos tercios del tráfico es anónimo. La regla `not_null`
+   que protege `orders` sería aquí un error de diseño.
+6. **Deriva de esquema** en `properties`: tres versiones de la web conviven
+   mandando campos distintos.
+7. **Relojes de cliente** adelantados, que solo caza `time_sanity`.
+
+## 14.2 El cambio de hora
+
+El histórico cubre las dos transiciones, y en ellas la hora local deja de ser
+una función biyectiva del instante:
+
+- el último domingo de octubre el reloj se atrasa y **la hora local 02:00-02:59
+  ocurre dos veces**, separadas por una hora real. Dos eventos ahí no son un
+  duplicado, y deduplicar por hora local se come la mitad sin dar ningún error;
+- el último domingo de marzo esa misma hora **no existe**, y aun así la
+  conversión devuelve algo.
+
+Las transiciones se detectan preguntándole a la base de datos de husos, no
+codificando «el último domingo de marzo»: esa regla ya cambió en el pasado, no
+es la misma en todos los países, y hay una directiva europea para suprimirla.
+
+El generador coloca tráfico ahí **a propósito**. Repartido al azar en un año, a
+esa hora de madrugada le tocaban 0,2 eventos: la trampa no aparecía.
+
+!!! aviso "Un bug en la función que escribí para explicar el problema"
+    `hora_ambigua` comparaba los desfases de `fold=0` y `fold=1`, que es la
+    implementación evidente. Está mal: `fold` cubre las **dos** anomalías, así
+    que devolvía `True` también para la hora que no existe. Lo que las separa es
+    el signo de la diferencia. Lo encontró un test escrito para documentar la
+    distinción, dando por hecho que la función ya la respetaba.
+
+## 14.3 TimescaleDB y AWS: una divergencia deliberada
+
+**RDS no ofrece la extensión `timescaledb` en ninguna versión, ni Aurora
+tampoco.** Comprobado contra la cuenta: no aparece en los `AllowedValues` de
+`shared_preload_libraries` de `postgres13` a `postgres17`. No es cuestión de
+edición ni de licencia.
+
+El DDL lo detecta y elige camino: *hypertable* si la extensión existe, tabla
+plana con índices **BRIN** si no. La tabla se llama igual, tiene las mismas
+columnas y **el código de los jobs no se entera**. Lo único que cambia es cómo
+Postgres coloca las filas en disco.
+
+## 14.4 La sesión no es el `session_id`
+
+El origen manda un `session_id` en cada evento y es tentador agrupar por él. No
+sirve: ese identificador vive en una cookie, y una cookie dura mucho más que una
+visita. Quien deja la pestaña abierta, come y vuelve por la tarde manda las dos
+visitas con el mismo identificador.
+
+Agrupar por él da sesiones de seis horas con cinco de pausa dentro. No falla
+nada: la duración media sale disparatada, la tasa de rebote bajísima, y los
+números son lo bastante creíbles como para que nadie los mire dos veces.
+
+La visita se **deriva del tiempo**, con el patrón de islas y huecos. El hueco de
+30 minutos es la convención del sector, no una verdad, así que está declarado y
+es un parámetro: cambiarlo cambia todas las métricas de sesión a la vez.
+
+---
+
+# 15. Los ficheros: la zona de aterrizaje
+
+El fichero que una distribuidora manda a una comercializadora tiene una forma
+muy concreta y viva por normativa: multi-registro, separado por `;`, latin-1,
+coma decimal y un **pie de control**. El fichero diario de una pasarela de pago
+es idéntico, por las mismas razones históricas.
+
+```
+C;LIQ;20260315;001;PSP_ACME
+D;14/03/2026;ORD-000481219;PAGO;125,40;2,81;EUR;VISA;Compra online
+D;14/03/2026;ORD-000481220;DEVOL;-45,00;-1,01;EUR;MC;Devolucion parcial
+P;000482;123456,78;2765,43
+```
+{: .ascii }
+
+## 15.1 Cinco fallos que no dan ningún error
+
+| Problema | Por qué cuesta detectarlo |
+|---|---|
+| Encoding latin-1 | Leído como UTF-8 no lanza excepción: sustituye los bytes y sigue |
+| Fecha `dd/mm/aaaa` | Leída como `MM/dd/yyyy` no falla **ningún día del mes ≤ 12**: parece intermitente |
+| Fichero truncado | Las líneas que llegaron están bien formadas |
+| Reenvío con otro nombre | La liquidación de un día entra dos veces |
+| Hueco en la secuencia | Un día sin liquidar y un día sin ventas producen lo mismo: nada |
+
+El primero, medido sobre un fichero real:
+
+```
+latin-1: D;...;BIZUM;Reembolso por articulo dañado
+utf-8:   D;...;BIZUM;Reembolso por articulo da?ado
+```
+{: .ascii }
+
+Y ese texto viaja hasta Gold sin que nada lo pare.
+
+## 15.2 Cuarentena de lote
+
+Concepto nuevo: hasta ahora el proyecto solo sabía apartar **filas**. Un fichero
+cuyo pie no cuadra va **entero** a cuarentena, con el original byte a byte y el
+motivo al lado. Media liquidación no es medio dato bueno: es un total que no
+cuadra y del que nadie se entera.
+
+Se comprueban las tres cosas que declara el pie, no solo el recuento. Un fichero
+con todos los registros pero mal sumado es **peor** que uno truncado: significa
+que el emisor y tú no estáis mirando lo mismo.
+
+## 15.3 Idempotencia por contenido
+
+El registro de control guarda el **hash del contenido**, no el nombre. Es lo
+único que caza una reexpedición bajo otro nombre. Solo cuenta como procesados
+los **aceptados**: un fichero rechazado tiene que poder reintentarse cuando el
+proveedor lo reenvíe completo.
+
+Es una tabla Iceberg y no DynamoDB: a decenas de ficheros al día sobra, no añade
+un servicio ni un endpoint de VPC, y queda consultable desde Athena — que es lo
+que quieres cuando alguien pregunta por qué falta la liquidación del martes.
+
+## 15.4 Verificado en AWS
+
+- **52 ficheros aceptados, 4 a cuarentena de lote** por descuadre del pie, con
+  los motivos concretos (`detalles_declarados=149 leidos=138`).
+- Huecos en la secuencia detectados y reportados.
+- **Segunda pasada: 0 aceptados y 52 reconocidos por su hash.** La idempotencia
+  no es una intención, está medida.
+
+---
+
+# 16. La conciliación: cuadrar contra un tercero
+
+El cuadre que existía desde la Fase 6 compara Gold con Silver, es decir **el
+pipeline consigo mismo**. Detecta joins que pierden o multiplican filas, pero no
+sabría decir que falta un fichero, porque lo que falta no está en ninguno de los
+dos lados.
+
+`agg_conciliacion_diaria` compara lo que dice Postgres con lo que dice el
+proveedor de pagos. Es la única métrica del mart que cruza **dos orígenes**, y
+por tanto la única capaz de detectar un fallo que ninguno ve por separado: cada
+fuente sigue siendo internamente coherente aunque falte una liquidación entera.
+
+## 16.1 Dos decisiones para que la señal siga sirviendo
+
+**El join es `FULL OUTER`.** Con un `inner`, un día con ventas y sin liquidación
+—literalmente el fichero que falta— desaparecería del informe.
+
+**El cuadre es en bruto**: cobros contra ventas. Devoluciones y comisiones se
+informan aparte, y no por simplificar: una devolución casi nunca cae el mismo
+día que su venta, y la comisión es el precio del servicio. Metiéndolas, **todos**
+los días saldrían descuadrados por motivos normales.
+
+## 16.2 El periodo cubierto
+
+La primera ejecución real dio **367 de 368 días descuadrados**. Correcto y
+completamente inútil: los ficheros cubrían 60 días y los pedidos un año entero,
+así que trescientos y pico días eran histórico que el proveedor nunca liquidó.
+
+Ese es el modo de fallo de casi toda alarma de calidad: **no que no detecte,
+sino que detecte tanto que deje de mirarse**. Ahora se concilia solo el periodo
+cubierto. Un día sin liquidar *dentro* de la ventana sigue siendo un fallo y
+sigue apareciendo; lo que se descarta es lo que nunca estuvo en el alcance.
+
+## 16.3 Un descuadre no tumba el job
+
+Los pedidos y las visitas son correctos aunque falte una liquidación, y fallar
+dejaría sin datos a quien no tiene nada que ver con el problema. Se publica como
+señal en `_quality/gold/conciliacion.json`, mismo criterio que en Silver: **el
+job informa, el orquestador decide**.
+
+## 16.4 Dimensión conformada y el estado `Parallel`
+
+`fct_sesion` cuelga de la **misma** `dim_customer` que `fct_order_items`, a un
+grano distinto. Eso es lo que permite preguntar «¿cuánto compran los clientes
+que llegaron por newsletter?» sin mantener dos definiciones de cliente que
+acabarían divergiendo. Las visitas anónimas caen en el miembro desconocido: con
+un `INNER JOIN` desaparecería el denominador y la conversión saldría
+disparatada.
+
+Las dos ingestas no comparten ni origen ni destino, así que corren en paralelo.
+Hasta la Fase 12 no había nada que paralelizar y la ausencia del estado
+`Parallel` estaba documentada como decisión consciente; con dos ramas de verdad,
+la decisión cambia. El `ResultPath` se descarta a propósito: un `Parallel`
+devuelve un array con el resultado de cada rama, y sin eso machacaría la entrada
+de Silver — fallando **en ejecución y no en el synth**.
+
+---
+
+# 17. Los tres fallos que solo aparecieron ejecutando
+
+Es la parte que más enseña de toda la ampliación. Los 200 tests estaban en verde
+y el pipeline reventó tres veces seguidas contra AWS.
+
+## 17.1 El registro dejó de ser homogéneo
+
+`INGESTION_ORDER` se recorría entero en tres sitios —la siembra del RDS, el
+exportador y la ingesta Bronze— y los tres reventaron al pedirle a un origen de
+ficheros un esquema, una watermark o una ventana de reproceso.
+
+**Ninguna suite podía cazarlo**, porque el fallo no está en una función que se
+pueda invocar: está en la línea que elige sobre qué iterar. El test que lo fija
+lee el código fuente, que es donde vive el problema.
+
+Ahora cada consumidor declara con qué tipo de origen sabe tratar, preguntando
+por el **tipo** en vez de mantener listas de excepciones. Silver sigue
+recorriéndolo entero, y está bien: lee de Bronze, donde todas las tablas ya son
+lo mismo.
+
+## 17.2 Spark no tiene tipo UUID
+
+`column "event_id" is of type uuid but expression is of type character varying`.
+Spark lo trata como texto, y el driver de Postgres declara los parámetros como
+`VARCHAR` y se niega a convertirlos aunque el valor sea un UUID perfectamente
+válido. Se arregla con `stringtype=unspecified`.
+
+Es de esos ajustes que no se descubren leyendo: aparecen la primera vez que una
+tabla usa un tipo que Spark no modela, y hasta entonces todo funciona.
+
+## 17.3 Truncar el origen invalida los watermarks
+
+El más instructivo de los tres. La siembra hace `TRUNCATE` y recarga; las marcas
+anteriores decían «ya leí hasta aquí» sobre datos que ya no existían, y los
+nuevos tenían fechas anteriores, así que la extracción incremental **los dio por
+vistos y no los leyó**.
+
+**No falló nada.** Bronze informó de «sin cambios» en cuatro tablas, exactamente
+lo que informaría un día tranquilo.
+
+Se descubrió cuadrando la conciliación: había días con **cobros del proveedor y
+cero pedidos**, porque las liquidaciones eran nuevas y los pedidos de Silver
+eran del lote anterior. Es el mejor argumento posible a favor de esa métrica:
+ninguna otra comprobación del proyecto podía verlo, porque cada fuente por
+separado seguía siendo coherente.
+
+Ahora el propio job invalida las marcas al terminar. Lo hace el job y no el
+Makefile a propósito: **quien invalida el estado debe ser quien lo rompe**, no
+quien se acuerde de llamarlo después.
+
+## 17.4 Lo que queda de todo esto
+
+1. **Una abstracción no se valida hasta que llega el segundo caso.** El refactor
+   de la Fase 10 parecía terminado, y las dos suposiciones que quedaban dentro
+   —que todo origen tiene esquema, que todo origen se recorre igual— solo
+   salieron con la fuente de ficheros delante.
+2. **Los tests verdes miden lo que sabes probar.** Los tres fallos vivían en
+   sitios sin cobertura posible: una línea de iteración, un tipo de columna, y
+   un estado externo en Parameter Store.
+3. **La comprobación que cruza dos fuentes es la única que ve lo que falta.**
+   Todo lo demás compara el sistema consigo mismo.
+
+---
+
+# 18. Calidad: tests, linting y pre-commit
 
 Dos suites, con dos entornos distintos:
 
@@ -903,7 +1249,7 @@ no haya dos fuentes de verdad.
 
 ---
 
-# 14. Referencia del Makefile
+# 19. Referencia del Makefile
 
 **Entorno**
 
@@ -952,7 +1298,7 @@ no haya dos fuentes de verdad.
 
 ---
 
-# 15. Costes
+# 20. Costes
 
 | Recurso | Coste si se deja desplegado |
 |---|---|
@@ -971,15 +1317,15 @@ sueltas cuestan céntimos.
 
 ---
 
-# 16. Git Flow, la release y el hotfix
+# 21. Git Flow, la release y el hotfix
 
-## 16.1 Las ramas
+## 21.1 Las ramas
 
 Cada fase del proyecto ha sido una rama `feature/*` con su PR contra `develop`:
 ocho fases, ocho PR. `main` estuvo en el commit inicial hasta la versión 1.0.0,
 que fue **la primera fusión real hacia producción**.
 
-## 16.2 La release 1.0.0
+## 21.2 La release 1.0.0
 
 La rama `release/1.0.0` solo toca tres cosas: el número de versión en
 `pyproject.toml` (único sitio donde vive), el `CHANGELOG.md` y el estado del
@@ -995,7 +1341,7 @@ Tres detalles de procedimiento que se olvidan y cuestan caro:
   back-merge se convertiría en un conflicto de los ocho merges enteros.
 - **El tag no viaja con `git push`**: hay que empujarlo explícitamente.
 
-## 16.3 El ejercicio del hotfix
+## 21.3 El ejercicio del hotfix
 
 La versión 1.0.0 salió con un bug deliberado, introducido como si fuera una
 micro-optimización de última hora — que es exactamente cómo entran estos bugs de
@@ -1054,12 +1400,12 @@ tres líneas es un cálculo que se volverá a romper.
 
 ---
 
-# 17. Bitácora de problemas
+# 22. Bitácora de problemas
 
 Todos los fallos reales del proyecto, con su síntoma y su causa. Los modos de
 fallo genéricos que ilustran están explicados en el glosario.
 
-## 17.1 Entorno local
+## 22.1 Entorno local
 
 | Síntoma | Causa y arreglo |
 |---|---|
@@ -1070,7 +1416,7 @@ fallo genéricos que ilustran están explicados en el glosario.
 | `ClassNotFoundException` al crear una tabla Iceberg en local | Los JAR están en la imagen pero fuera del classpath. Los añade `spark_session.py` con un glob. |
 | El venv del CDK no se crea en Ubuntu | Ubuntu separa `ensurepip`. `sudo apt install python3.12-venv`. |
 
-## 17.2 AWS
+## 22.2 AWS
 
 | Síntoma | Causa y arreglo |
 |---|---|
@@ -1083,7 +1429,7 @@ fallo genéricos que ilustran están explicados en el glosario.
 | Bronze vacío tras un `destroy` + `deploy` | Los watermarks viven en SSM y sobreviven al borrado del stack. `make reset-watermarks`. |
 | El coste de los endpoints de interfaz supera al del NAT | Se pagan por endpoint **y por AZ**. Desplegarlos en una sola AZ. |
 
-## 17.3 Procesos y verificación
+## 22.3 Procesos y verificación
 
 | Síntoma | Causa y arreglo |
 |---|---|
@@ -1093,7 +1439,7 @@ fallo genéricos que ilustran están explicados en el glosario.
 | El CI en verde habiendo probado el 20% de la suite | `importorskip` en un entorno sin PySpark. Ver §12.1. |
 | El PR que introduce el CI no dispara el CI | GitHub no registra los workflows hasta que llegan a la rama por defecto. |
 
-## 17.4 Lo que se aprendió
+## 22.4 Lo que se aprendió
 
 Tres cosas se repiten en casi todas las filas de arriba:
 
