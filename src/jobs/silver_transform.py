@@ -45,6 +45,7 @@ from common.config import (
     get_table,
 )
 from common.quality import ERRORS_COLUMN, QualityReport, report, split
+from common.sessions import resumir_sesiones
 from common.spark_session import CATALOG, build_session
 from common.transforms import deduplicate, drop_bronze_only_columns, normalize
 
@@ -213,6 +214,33 @@ def process_table(
     return resultado
 
 
+def build_web_sessions(spark: SparkSession, environment: str) -> int:
+    """Reconstruye las visitas a partir de los eventos ya limpios.
+
+    Es la primera tabla de Silver que **no viene de Bronze**: se deriva de otra
+    tabla de Silver. Por eso no pasa por `process_table` ni entra en el informe
+    de calidad, y por eso se reconstruye entera en vez de mergearse: una visita
+    no es un registro del origen que se pueda actualizar, es el resultado de
+    mirar todos los eventos de un visitante a la vez. Con un evento tardio, la
+    visita de anteayer puede cambiar de duracion.
+
+    Cuesta releer los eventos enteros. Alternativa seria recalcular solo las
+    visitas tocadas por el lote, que es mas rapido y bastante mas facil de
+    equivocar; a este volumen no compensa.
+    """
+    eventos = spark.table(table_name("web_events", environment))
+    sesiones = resumir_sesiones(eventos)
+    destino = table_name("web_sessions", environment)
+
+    (
+        sesiones.writeTo(destino)
+        .using("iceberg")
+        .partitionedBy(F.days("session_start"))
+        .createOrReplace()
+    )
+    return sesiones.count()
+
+
 def write_summary(bucket: str, reports: list[QualityReport], batch_id: str) -> dict:
     """Deja el resultado de calidad en S3.
 
@@ -281,6 +309,12 @@ def main() -> None:
         log("no habia nada que procesar")
         spark.stop()
         return
+
+    # Las visitas se derivan despues de que los eventos esten limpios y
+    # deduplicados: sesionizar sobre Bronze contaria dos veces cada reenvio.
+    if "web_events" in tables:
+        n_sesiones = build_web_sessions(spark, environment)
+        log(f"web_sessions: {n_sesiones} visitas derivadas de los eventos")
 
     resumen = write_summary(bucket, reports, batch_id)
     log("--- calidad ---")

@@ -102,6 +102,12 @@ class EventDirtRates:
     cantidad_absurda: float = 0.002
     """Un carrito de miles de unidades. Casi siempre es un bot o un test."""
 
+    pausa_larga: float = 0.05
+    """Un hueco de horas dentro del MISMO session_id. No es suciedad: es la
+    prueba de que el identificador que manda el cliente no delimita una visita.
+    Sin esto, sesionizar por inactividad daria exactamente lo mismo que
+    agrupar por session_id, y el ejercicio no ensenaria nada."""
+
     @classmethod
     def scaled(cls, factor: float) -> EventDirtRates:
         base = cls()
@@ -201,7 +207,14 @@ def _sesion(
 
     def emitir(tipo: str, product_id=None, quantity=None, amount=None) -> None:
         nonlocal reloj
-        reloj = reloj + timedelta(seconds=random.randint(5, 240))
+        if random.random() < dirt.pausa_larga:
+            # El visitante deja la pestana abierta y vuelve horas despues. La
+            # cookie sigue viva, asi que el `session_id` es el MISMO, pero son
+            # dos visitas distintas. Por eso el identificador que manda el
+            # cliente no es una sesion: hay que derivarla del tiempo.
+            reloj = reloj + timedelta(minutes=random.randint(35, 400))
+        else:
+            reloj = reloj + timedelta(seconds=random.randint(5, 240))
         event_time = reloj
 
         # received_at: normalmente unos segundos despues del evento.
